@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          branch="${GITHUB_REF_NAME}"
+          branch="${branch//\//-}"
+          short_sha="${GITHUB_SHA::12}"
+          release_tag="v${version}-${branch}-${short_sha}"
+          release_version="${release_tag#v}"
+          release_name="AgentCage ${version} ${branch} (${short_sha})"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          version="${{ needs.prepare.outputs.release_version }}"
+          package="agentcage-${version}-${{ matrix.target }}"
+          staging="dist/${package}"
+          mkdir -p "${staging}/target/release"
+          install -m 0755 "target/${{ matrix.target }}/release/ac" "${staging}/target/release/ac"
+          install -m 0755 install.sh "${staging}/install.sh"
+          install -m 0644 Cargo.toml "${staging}/Cargo.toml"
+          install -m 0644 Cargo.lock "${staging}/Cargo.lock"
+          install -m 0644 Dockerfile "${staging}/Dockerfile"
+          install -m 0644 README.md "${staging}/README.md"
+          install -m 0644 TUTORIAL.md "${staging}/TUTORIAL.md"
+          install -m 0644 LICENSE "${staging}/LICENSE"
+          mkdir -p "${staging}/src"
+          install -m 0644 src/*.rs "${staging}/src/"
+          tarball="dist/${package}.tar.gz"
+          tar -C dist -czf "${tarball}" "${package}"
+          echo "TARBALL=${tarball}" >> "$GITHUB_ENV"
+          echo "PACKAGE=${package}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.TARBALL }}
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: artifacts/**/*.tar.gz
