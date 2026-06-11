@@ -47,6 +47,16 @@ while [ "$#" -gt 0 ]; do
 done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ ! -f "$script_dir/Cargo.toml" ]; then
+    echo "No Cargo.toml found in $script_dir. Cloning repository..."
+    temp_dir=$(mktemp -d)
+    git clone https://github.com/JanDub-code/AgentCage.git "$temp_dir"
+    "$temp_dir/install.sh" "$@"
+    rm -rf "$temp_dir"
+    exit 0
+fi
+
 cd "$script_dir"
 
 if [ -z "$bindir" ]; then

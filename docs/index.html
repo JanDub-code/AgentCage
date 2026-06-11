@@ -376,6 +376,83 @@
         .tooltip {
             position: relative;
         }
+
+        /* Platform Badge (Linux only notice) */
+        .platform-badge {
+            background: rgba(255, 107, 0, 0.08);
+            border: 1px solid rgba(255, 107, 0, 0.2);
+            color: #ff914d;
+            border-radius: 50px;
+            padding: 0.4rem 1.2rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            margin-bottom: 2rem;
+            letter-spacing: 0.02em;
+            box-shadow: 0 4px 12px rgba(255, 107, 0, 0.05);
+        }
+
+        .platform-badge svg {
+            color: var(--primary);
+        }
+
+        /* Install Box & Tabs */
+        .install-box {
+            background: var(--terminal-bg);
+            border: 1px solid var(--terminal-border);
+            border-radius: 12px;
+            margin-bottom: 2.5rem;
+            overflow: hidden;
+            box-shadow: inset 0 2px 8px rgba(0,0,0,0.8);
+        }
+
+        .install-tabs {
+            display: flex;
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--terminal-border);
+            padding: 0 0.5rem;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.95rem;
+            padding: 0.8rem 1.25rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+
+        .tab-btn:hover {
+            color: #ffffff;
+        }
+
+        .tab-btn.active {
+            color: #ffffff;
+            border-bottom-color: var(--secondary);
+        }
+
+        .install-content {
+            padding: 1.25rem;
+        }
+
+        .tab-pane {
+            display: none;
+        }
+
+        .tab-pane.active {
+            display: block;
+        }
+
+        .install-content .terminal-line {
+            margin-bottom: 0;
+        }
     </style>
 </head>
 <body>
@@ -393,6 +470,10 @@
             <p class="description">
                 AgentCage mounts only the current directory, keeps your home and credentials out of reach, and auto-deletes the container when the agent exits. One command, one repo, no traces.
             </p>
+            <div class="platform-badge">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                Linux only &bull; Requires Rootless Podman
+            </div>
         </header>
 
         <!-- Document Links -->
@@ -422,6 +503,43 @@
         <!-- Glass Card Content -->
         <main class="glass-card">
             
+            <!-- Installation Section -->
+            <h2>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                Installation
+            </h2>
+
+            <div class="install-box">
+                <div class="install-tabs">
+                    <button class="tab-btn active" onclick="switchInstallTab(event, 'curl')">curl</button>
+                    <button class="tab-btn" onclick="switchInstallTab(event, 'cargo')">cargo</button>
+                    <button class="tab-btn" onclick="switchInstallTab(event, 'git')">git</button>
+                </div>
+                <div class="install-content">
+                    <div id="install-curl" class="tab-pane active">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd">curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh | bash</span>
+                            <button class="copy-btn" onclick="copyToClipboard('curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh | bash', this)">Copy</button>
+                        </div>
+                    </div>
+                    <div id="install-cargo" class="tab-pane">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd">cargo install agentcage</span>
+                            <button class="copy-btn" onclick="copyToClipboard('cargo install agentcage', this)">Copy</button>
+                        </div>
+                    </div>
+                    <div id="install-git" class="tab-pane">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd">git clone https://github.com/JanDub-code/AgentCage.git &amp;&amp; cd AgentCage &amp;&amp; ./install.sh</span>
+                            <button class="copy-btn" onclick="copyToClipboard('git clone https://github.com/JanDub-code/AgentCage.git &amp;&amp; cd AgentCage &amp;&amp; ./install.sh', this)">Copy</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Quick Start Section -->
             <h2>
                 <!-- Terminal Icon -->
@@ -530,6 +648,17 @@
             }, function(err) {
                 console.error('Could not copy text: ', err);
             });
+        }
+
+        function switchInstallTab(event, tabName) {
+            const tabPanes = document.querySelectorAll('.tab-pane');
+            tabPanes.forEach(pane => pane.classList.remove('active'));
+
+            const tabBtns = document.querySelectorAll('.tab-btn');
+            tabBtns.forEach(btn => btn.classList.remove('active'));
+
+            document.getElementById('install-' + tabName).classList.add('active');
+            event.currentTarget.classList.add('active');
         }
     </script>
 </body>

@@ -52,6 +52,12 @@ true
 
 ## Install
 
+### Quick installation (via curl)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh | bash
+```
+
 ### From a release package
 
 ```bash
