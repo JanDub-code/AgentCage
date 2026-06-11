@@ -13,6 +13,10 @@ It is meant for the times you want to try an experimental, open-source, foreign-
 
 > AgentCage is a practical containment tool, not a VM and not a perfect sandbox. Read [the security model](#security-model) before using it with secrets or untrusted prompts.
 
+![AgentCage hero image](docs/agentcage-hero.png)
+
+> Promo artwork generated with ChatGPT.
+
 ## What it does
 
 - Mounts only the current directory as `/workspace/project`
