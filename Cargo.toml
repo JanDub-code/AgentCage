@@ -1,0 +1,13 @@
+[package]
+name = "agentcage"
+version = "0.1.0"
+edition = "2021"
+description = "Run AI coding agents in a disposable Podman cage"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "ac"
+path = "src/main.rs"
