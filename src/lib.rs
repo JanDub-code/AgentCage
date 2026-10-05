@@ -1,9 +1,15 @@
+use std::cell::Cell;
 use std::env;
+use std::ffi::{CString, OsString};
 use std::fs;
-use std::io::{self, ErrorKind, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -22,8 +28,24 @@ const LOGINS_DIR_NAME: &str = "logins";
 const CONTAINER_LOGIN_SYNC: &str = "/workspace/login-sync";
 const LOGIN_STAGING_PREFIX: &str = "agentcage-login-";
 const LOGIN_STAGING_OWNER_FILE: &str = ".agentcage-owner-pid";
+const LOGIN_STAGING_COMPLETE_FILE: &str = ".agentcage-copy-complete";
 const STALE_LOGIN_STAGING_SECS: u64 = 24 * 60 * 60;
 const MAX_LOGIN_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const CONTAINER_OWNER_LABEL: &str = "io.agentcage.managed=true";
+const OPENCODE_ACCOUNT_BRIDGE: &str = include_str!("opencode_account.py");
+const LOGIN_FILE_SYNC: &str = include_str!("login_sync.py");
+// OCI process arguments are JSON strings. Transport opaque Linux argv as
+// bounded ASCII chunks, then exec the agent with the original bytes.
+const OPAQUE_ARGV_EXEC: &str = r#"import os, sys
+argv = [os.fsencode(sys.argv[1])]
+position = 2
+while position < len(sys.argv):
+    count = int(sys.argv[position])
+    position += 1
+    argv.append(bytes.fromhex(''.join(sys.argv[position:position + count])))
+    position += count
+os.execvp(argv[0], argv)
+"#;
 
 const LOGIN_SYNC_SCRIPT: &str = r#"
 set -u
@@ -42,78 +64,33 @@ while [ "$i" -lt "$path_count" ]; do
     shift
     i=$((i + 1))
 done
+account_bridge="$1"
+shift
+file_sync="$1"
+shift
 
-file_size_ok() {
-    local path="$1"
-    local rel="$2"
-    local bytes
-    bytes="$(wc -c < "$path" 2>/dev/null)" || return 1
-    case "$bytes" in
-        ''|*[!0-9]*) echo "agentcage: invalid login credential size: $rel" >&2; return 1 ;;
-    esac
-    if [ "$bytes" -gt "$max_bytes" ]; then
-        echo "agentcage: login credential too large, not syncing: $rel" >&2
-        return 1
-    fi
-    return 0
-}
-
-copy_private_file() {
-    local src="$1"
-    local dst="$2"
-    local tmp="${dst}.agentcage-tmp.$$"
-    rm -f "$tmp" 2>/dev/null || return 1
-    cp "$src" "$tmp" || { rm -f "$tmp" 2>/dev/null || true; return 1; }
-    chmod 0600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$dst" || { rm -f "$tmp" 2>/dev/null || true; return 1; }
-}
-
-copy_in() {
-    for rel in "${paths[@]}"; do
-        case "$rel" in
-            ""|/*|*..*) echo "agentcage: invalid login path: $rel" >&2; return 1 ;;
-        esac
-        src="$store/$rel"
-        dst="$HOME/$rel"
-        if [ -L "$src" ]; then
-            echo "agentcage: refusing symlinked login credential: $rel" >&2
-            return 1
-        fi
-        if [ -f "$src" ]; then
-            file_size_ok "$src" "$rel" || return 1
-            mkdir -p "$(dirname "$dst")" || return 1
-            copy_private_file "$src" "$dst" || return 1
-        fi
-    done
-}
-
-copy_out() {
-    local ok=0
-    for rel in "${paths[@]}"; do
-        src="$HOME/$rel"
-        dst="$store/$rel"
-        if [ -L "$src" ]; then
-            echo "agentcage: warning: ignoring symlinked login credential: $rel" >&2
-        elif [ -f "$src" ]; then
-            if file_size_ok "$src" "$rel"; then
-                mkdir -p "$(dirname "$dst")" || ok=1
-                copy_private_file "$src" "$dst" || ok=1
-            else
-                ok=1
-            fi
-        elif [ -e "$src" ]; then
-            echo "agentcage: warning: ignoring non-regular login credential: $rel" >&2
-        else
-            rm -f "$dst" 2>/dev/null || true
-        fi
-    done
-    return "$ok"
-}
-
-copy_in || exit 1
+python3 -c "$file_sync" "$store" "$HOME" "$max_bytes" "${paths[@]}" || exit 1
+if [ -n "$account_bridge" ]; then
+    opencode db 'SELECT 1' > /dev/null || exit 1
+    python3 -c "$account_bridge" import || exit 1
+fi
+interrupted=0
+trap 'interrupted=130' INT
+trap 'interrupted=143' TERM
+trap 'interrupted=129' HUP
 "$@"
 status=$?
-copy_out || echo "agentcage: warning: failed to save login credentials" >&2
+if [ "$interrupted" -ne 0 ]; then status="$interrupted"; fi
+if [ -n "$account_bridge" ] && ! python3 -c "$account_bridge" export; then
+    # A failed account export leaves an unvalidated session snapshot. Keep the
+    # original staging files instead of publishing any partial login changes.
+    if [ "$status" -eq 0 ]; then status=1; fi
+    exit "$status"
+fi
+if ! python3 -c "$file_sync" --export "$HOME" "$store" "$max_bytes" "${paths[@]}"; then
+    echo "agentcage: failed to save login credentials" >&2
+    if [ "$status" -eq 0 ]; then status=1; fi
+fi
 exit "$status"
 "#;
 
@@ -129,12 +106,18 @@ const RUNTIME_ENV_VARS: &[(&str, &str)] = &[
     ("XDG_STATE_HOME", "/workspace/session-home/.local/state"),
     ("NPM_CONFIG_CACHE", "/workspace/session-home/.npm"),
     ("BUN_INSTALL", "/workspace/session-home/.bun"),
+    (
+        "OPENCODE_DB",
+        "/workspace/session-home/.local/share/opencode/opencode.db",
+    ),
 ];
 
 pub fn run() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // A closed output pipe is ordinary Unix CLI termination, not a Rust panic.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
     match dispatch(&args) {
-        Ok(()) => {}
+        Ok(code) => process::exit(code),
         Err(e) => {
             eprintln!("error: {e}");
             process::exit(1);
@@ -148,7 +131,7 @@ enum Cmd {
         name: String,
         env: Option<String>,
         login: LoginPolicy,
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     Shell {
         env: Option<String>,
@@ -180,8 +163,11 @@ enum LoginMount {
         agent: String,
         host_path: PathBuf,
         staging_path: PathBuf,
+        staging_dir: fs::File,
         paths: &'static [&'static str],
-        has_saved: bool,
+        baseline: Vec<Option<Vec<u8>>>,
+        revocation: u64,
+        retain_on_save_failure: Cell<bool>,
     },
 }
 
@@ -191,32 +177,66 @@ enum LoginPolicy {
     Disabled,
 }
 
-fn dispatch(args: &[String]) -> Result<(), String> {
-    let cmd = parse(args)?;
-    let cwd = env::current_dir().map_err(|e| format!("cannot read current directory: {e}"))?;
+fn dispatch(args: &[OsString]) -> Result<i32, String> {
+    let cmd = parse_os(args)?;
+    let cwd = || env::current_dir().map_err(|e| format!("cannot read current directory: {e}"));
     match cmd {
-        Cmd::Init => cmd_init(&cwd),
+        Cmd::Init => cmd_init(&cwd()?).map(|_| 0),
         Cmd::Agent {
             name,
             env,
             login,
             args: extra,
-        } => cmd_agent(&cwd, &name, env.as_deref(), login, &extra),
-        Cmd::Shell { env } => cmd_shell(&cwd, env.as_deref()),
-        Cmd::Clean => cmd_clean(&cwd),
-        Cmd::EnvList => cmd_env_list(&cwd),
-        Cmd::EnvRemove { name } => cmd_env_remove(&cwd, &name),
-        Cmd::LoginList => cmd_login_list(),
-        Cmd::LoginRemove { agent } => cmd_login_remove(&agent),
+        } => cmd_agent(&cwd()?, &name, env.as_deref(), login, &extra),
+        Cmd::Shell { env } => cmd_shell(&cwd()?, env.as_deref()),
+        Cmd::Clean => cmd_clean().map(|_| 0),
+        Cmd::EnvList => cmd_env_list(&cwd()?).map(|_| 0),
+        Cmd::EnvRemove { name } => cmd_env_remove(&cwd()?, &name).map(|_| 0),
+        Cmd::LoginList => cmd_login_list().map(|_| 0),
+        Cmd::LoginRemove { agent } => cmd_login_remove(&agent).map(|_| 0),
         Cmd::Help => {
             print_help();
-            Ok(())
+            Ok(0)
         }
         Cmd::Completions { shell } => {
             print_completions(&shell);
-            Ok(())
+            Ok(0)
         }
     }
+}
+
+fn parse_os(args: &[OsString]) -> Result<Cmd, String> {
+    let agent_command = args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .map(|name| agent::resolve(name).is_ok())
+        .unwrap_or(false);
+    let mut wrapper = Vec::new();
+    let mut env_value = false;
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 && agent_command && !env_value && arg == "--" {
+            wrapper.push("--".to_string());
+            let mut parsed = parse(&wrapper)?;
+            if let Cmd::Agent { args: extra, .. } = &mut parsed {
+                // Unix agent arguments are opaque bytes, including filenames
+                // that cannot be represented in UTF-8.
+                extra.extend_from_slice(&args[index + 1..]);
+            }
+            return Ok(parsed);
+        }
+        let text = arg
+            .to_str()
+            .ok_or("wrapper arguments must be UTF-8; pass opaque agent arguments after '--'")?;
+        wrapper.push(text.to_string());
+        if index > 0 && agent_command {
+            if env_value {
+                env_value = false;
+            } else if text == "--env" {
+                env_value = true;
+            }
+        }
+    }
+    parse(&wrapper)
 }
 
 fn parse(args: &[String]) -> Result<Cmd, String> {
@@ -257,19 +277,22 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
                     }
                     "-h" | "--help" => return Ok(Cmd::Help),
                     "--" => {
-                        extra = rest[i + 1..].to_vec();
+                        extra.extend_from_slice(&rest[i + 1..]);
                         break;
                     }
-                    arg if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
+                    arg if arg.starts_with('-') => return Err(format!("unknown wrapper option '{arg}'. pass agent options after '--', for example: {CLI} {name} -- {arg}")),
                     arg => extra.push(arg.to_string()),
                 }
                 i += 1;
+            }
+            if matches!(login, LoginPolicy::Disabled) && env.is_some() {
+                return Err("--no-login cannot be combined with --env because --env reuses a full persistent home that may already contain credentials".into());
             }
             Ok(Cmd::Agent {
                 name,
                 env,
                 login,
-                args: extra,
+                args: extra.into_iter().map(OsString::from).collect(),
             })
         }
         "shell" => {
@@ -470,7 +493,13 @@ fn cmd_init(cwd: &Path) -> Result<(), String> {
     let podman = detect_podman()?;
 
     ensure_cage_dir(cwd)?;
-    ensure_runtime_image(&podman)?;
+
+    if !podman.image_ready {
+        let status = build_image(&podman)?;
+        if !status.success() {
+            return Err("image build failed. check the output above".into());
+        }
+    }
 
     println!("AgentCage — ready");
     println!("  image:  {}", IMAGE);
@@ -509,104 +538,143 @@ fn cmd_agent(
     agent_name: &str,
     env_name: Option<&str>,
     login_policy: LoginPolicy,
-    extra_args: &[String],
-) -> Result<(), String> {
+    extra_args: &[OsString],
+) -> Result<i32, String> {
+    // The forwarding threads must report a closed pipe and still finalize
+    // credentials and reap Podman, rather than terminate the parent early.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     ensure_cage_dir(cwd)?;
     if matches!(login_policy, LoginPolicy::Disabled) && env_name.is_some() {
         return Err("--no-login cannot be combined with --env because --env reuses a full persistent home that may already contain credentials".into());
     }
 
-    let agent_info = agent::resolve(agent_name)?;
+    let command = agent::resolve(agent_name).map_err(|e| e)?;
     let podman = detect_podman()?;
-    ensure_runtime_image(&podman)?;
-    ensure_tool_cache_volume(&podman)?;
+    if !podman.image_exists {
+        return Err(format!("image '{IMAGE}' not found. run '{CLI}' first"));
+    }
+    if !podman.image_ready {
+        return Err(format!(
+            "image '{IMAGE}' is outdated or was built for a different host UID/GID. run '{CLI}' to rebuild it"
+        ));
+    }
 
     let home_mount = resolve_home_mount(cwd, env_name)?;
     let login_mount = resolve_login_mount(agent_name, &home_mount, login_policy)?;
     print_status(cwd, &home_mount, &login_mount);
-    print_agent_startup_hints(&podman, agent_info, &login_mount);
     let result = (|| {
-        let (argv, container_name) = build_run_argv(
-            cwd,
-            Some(agent_info),
-            extra_args,
-            false,
-            &home_mount,
-            &login_mount,
-        )?;
+        let (argv, container_name) =
+            build_run_argv(cwd, command, extra_args, &home_mount, &login_mount)?;
         run_podman(&argv, &container_name, &login_mount)
     })();
-    if let Err(e) = result {
-        cleanup_login_staging(&login_mount);
-        let _ = harden_persistent_home(&home_mount);
-        return Err(e);
-    }
-    harden_persistent_home(&home_mount)
+    let result = combine_session_result(result, cleanup_login_staging(&login_mount));
+    combine_session_result(result, harden_persistent_home(&home_mount))
 }
 
-fn cmd_shell(cwd: &Path, env_name: Option<&str>) -> Result<(), String> {
+fn cmd_shell(cwd: &Path, env_name: Option<&str>) -> Result<i32, String> {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     ensure_cage_dir(cwd)?;
     let podman = detect_podman()?;
-    ensure_runtime_image(&podman)?;
-    ensure_tool_cache_volume(&podman)?;
+    if !podman.image_exists {
+        return Err(format!("image '{IMAGE}' not found. run '{CLI}' first"));
+    }
+    if !podman.image_ready {
+        return Err(format!(
+            "image '{IMAGE}' is outdated or was built for a different host UID/GID. run '{CLI}' to rebuild it"
+        ));
+    }
     let home_mount = resolve_home_mount(cwd, env_name)?;
     let login_mount = LoginMount::None;
     print_status(cwd, &home_mount, &login_mount);
-    let (argv, container_name) = build_run_argv(cwd, None, &[], true, &home_mount, &login_mount)?;
-    run_podman(&argv, &container_name, &login_mount)?;
-    harden_persistent_home(&home_mount)
+    let (argv, container_name) = build_run_argv(cwd, "bash", &[], &home_mount, &login_mount)?;
+    let result = run_podman(&argv, &container_name, &login_mount);
+    combine_session_result(result, harden_persistent_home(&home_mount))
 }
 
-fn cmd_clean(_cwd: &Path) -> Result<(), String> {
+fn combine_session_result(
+    result: Result<i32, String>,
+    cleanup: Result<(), String>,
+) -> Result<i32, String> {
+    match (result, cleanup) {
+        (Ok(0), Err(e)) => Err(e),
+        (Ok(code), Err(e)) => {
+            eprintln!("error: {e}");
+            Ok(code)
+        }
+        (Err(e), Err(cleanup)) => Err(format!("{e}; cleanup also failed: {cleanup}")),
+        (result, Ok(())) => result,
+    }
+}
+
+fn cmd_clean() -> Result<(), String> {
     let podman = detect_podman()?;
     let output = Command::new(&podman.executable)
         .args([
             "ps",
             "-a",
             "--filter",
-            "name=agentcage",
+            "label=io.agentcage.managed=true",
+            "--filter",
+            "status=exited",
+            "--filter",
+            "status=created",
+            "--filter",
+            "status=stopped",
+            "--no-trunc",
             "--format",
-            "{{.Names}}",
+            "{{.ID}}",
         ])
         .output()
         .map_err(|e| format!("podman ps failed: {e}"))?;
-    let names = String::from_utf8_lossy(&output.stdout);
-    let containers: Vec<&str> = names.lines().filter(|l| !l.is_empty()).collect();
+    check_podman_output("podman ps", &output)?;
+    let ids = String::from_utf8_lossy(&output.stdout);
+    let containers: Vec<&str> = ids.lines().filter(|l| !l.is_empty()).collect();
     if containers.is_empty() {
         println!("AgentCage — nothing to clean");
-        println!();
-        println!("note: installed agents are cached in the 'agentcage-tools' podman volume.");
-        println!("to remove it: podman volume rm agentcage-tools");
         return Ok(());
     }
-    for name in containers {
-        println!("removing container: {name}");
-        let _ = Command::new(&podman.executable)
-            .args(["rm", "-f", name])
-            .status();
+    let mut failures = Vec::new();
+    for id in containers {
+        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("podman ps returned an invalid container ID; cleanup stopped".into());
+        }
+        let result = Command::new(&podman.executable)
+            .args(["rm", "--ignore", id])
+            .output()
+            .map_err(|e| format!("podman rm failed: {e}"))
+            .and_then(|output| {
+                check_podman_output("podman rm", &output)?;
+                if output.stdout.is_empty() {
+                    println!("container already absent: {id}");
+                } else {
+                    println!("removed container: {id}");
+                }
+                Ok(())
+            });
+        if let Err(e) = result {
+            eprintln!("cannot remove {id}: {e}");
+            failures.push(id);
+        }
     }
-    println!("done");
-    println!();
-    println!("note: installed agents are cached in the 'agentcage-tools' podman volume.");
-    println!("to remove it: podman volume rm agentcage-tools");
-    Ok(())
+    if failures.is_empty() {
+        println!("cleanup complete");
+        Ok(())
+    } else {
+        Err(format!(
+            "cleanup incomplete: {} container(s) could not be removed",
+            failures.len()
+        ))
+    }
 }
 
 fn cmd_env_list(cwd: &Path) -> Result<(), String> {
-    let envs_dir = ensure_cage_dir(cwd)?.join(ENVS_DIR_NAME);
-    let entries = match fs::read_dir(&envs_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            println!("no persistent environments");
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(format!(
-                "cannot list environments in {}: {e}",
-                envs_dir.display()
-            ))
-        }
+    let cage = open_private_root(&ensure_cage_dir(cwd)?)?;
+    let Some((envs, _)) = relative_parent(&cage, "envs/.unused", false)? else {
+        println!("no persistent environments");
+        return Ok(());
     };
+    let entries = fs::read_dir(format!("/proc/self/fd/{}", envs.as_raw_fd()))
+        .map_err(|e| format!("cannot list persistent environments: {e}"))?;
 
     let mut names = Vec::new();
     for entry in entries {
@@ -635,77 +703,36 @@ fn cmd_env_list(cwd: &Path) -> Result<(), String> {
 
 fn cmd_env_remove(cwd: &Path, name: &str) -> Result<(), String> {
     validate_env_name(name)?;
-    let env_dir = ensure_cage_dir(cwd)?.join(ENVS_DIR_NAME).join(name);
-    match fs::symlink_metadata(&env_dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "refusing to remove symlinked environment {}",
-                env_dir.display()
-            ));
-        }
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(format!(
-                "environment path exists but is not a directory: {}",
-                env_dir.display()
-            ));
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(format!("environment '{name}' does not exist"));
-        }
-        Err(e) => {
-            return Err(format!(
-                "cannot inspect environment '{}': {e}",
-                env_dir.display()
-            ));
-        }
-    }
-    match fs::remove_dir_all(&env_dir) {
+    let cage = open_private_root(&ensure_cage_dir(cwd)?)?;
+    let Some((_parent, anchored_path)) = directory_for_removal(&cage, &format!("envs/{name}"))?
+    else {
+        return Err(format!("environment '{name}' does not exist"));
+    };
+    match fs::remove_dir_all(&anchored_path) {
         Ok(()) => {
             println!("removed environment: {name}");
             Ok(())
         }
-        Err(e) => Err(format!(
-            "cannot remove environment '{}': {e}",
-            env_dir.display()
-        )),
+        Err(e) => Err(format!("cannot remove environment '{}': {e}", name)),
     }
 }
 
 fn cmd_login_list() -> Result<(), String> {
-    let logins_dir = match logins_dir() {
-        Ok(path) => path,
-        Err(e) => return Err(e),
-    };
-    let entries = match fs::read_dir(&logins_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            println!("no saved logins");
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(format!(
-                "cannot list saved logins in {}: {e}",
-                logins_dir.display()
-            ))
-        }
-    };
-
     let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read login entry: {e}"))?;
-        let kind = entry
-            .file_type()
-            .map_err(|e| format!("cannot inspect login entry: {e}"))?;
-        if !kind.is_dir() {
-            continue;
+    for (name, _) in agent::SUPPORTED_AGENTS {
+        let _lock = LoginLock::acquire(name)?;
+        let dir = login_dir(name)?;
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot inspect saved login {name}: {e}")),
+            Ok(_) => {}
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if login_paths_for_agent(&name).is_empty() {
-            continue;
-        }
-        if login_store_has_files(&name, &entry.path(), login_paths_for_agent(&name)) {
-            names.push(name);
+        let root = open_private_root(&dir)?;
+        if read_login_snapshot(name, &root, login_paths_for_agent(name))?
+            .iter()
+            .any(Option::is_some)
+        {
+            names.push(*name);
         }
     }
     names.sort();
@@ -724,40 +751,21 @@ fn cmd_login_list() -> Result<(), String> {
 
 fn cmd_login_remove(agent_name: &str) -> Result<(), String> {
     validate_login_agent(agent_name)?;
-    let login_dir = login_dir(agent_name)?;
-    match fs::symlink_metadata(&login_dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "refusing to remove symlinked saved login {}",
-                login_dir.display()
-            ));
-        }
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(format!(
-                "saved login path exists but is not a directory: {}",
-                login_dir.display()
-            ));
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(format!("saved login for '{agent_name}' does not exist"));
-        }
-        Err(e) => {
-            return Err(format!(
-                "cannot inspect saved login '{}': {e}",
-                login_dir.display()
-            ));
-        }
-    }
-    match fs::remove_dir_all(&login_dir) {
+    let mut lock = LoginLock::acquire(agent_name)?;
+    let data = open_private_root(&agentcage_data_dir()?)?;
+    let target = directory_for_removal(&data, &format!("logins/{agent_name}"))?;
+    // Record revocation outside the credential tree before deleting it.
+    lock.revoke()?;
+    let Some((_parent, anchored_path)) = target else {
+        println!("no saved login for {agent_name}; older sessions cannot restore it");
+        return Ok(());
+    };
+    match fs::remove_dir_all(&anchored_path) {
         Ok(()) => {
             println!("removed saved login: {agent_name}");
             Ok(())
         }
-        Err(e) => Err(format!(
-            "cannot remove saved login '{}': {e}",
-            login_dir.display()
-        )),
+        Err(e) => Err(format!("cannot remove saved login '{}': {e}", agent_name)),
     }
 }
 
@@ -775,73 +783,25 @@ fn print_status(cwd: &Path, home_mount: &HomeMount, login_mount: &LoginMount) {
         (
             _,
             LoginMount::Persistent {
-                agent,
-                host_path,
-                has_saved,
-                ..
+                agent, host_path, ..
             },
         ) => {
-            if *has_saved {
-                format!("saved {agent} auth only ({})", host_path.display())
-            } else {
-                format!(
-                    "first {agent} login will be saved ({})",
-                    host_path.display()
-                )
-            }
+            format!("saved {agent} auth only ({})", host_path.display())
         }
         _ => "disposable".to_string(),
     };
     let host_home_line = match login_mount {
-        LoginMount::Persistent { .. } => "not mounted; login sync uses a filtered temp bind",
-        LoginMount::None | LoginMount::Disabled => "not mounted",
+        LoginMount::Persistent { .. } => "not separately mounted; auth-only temp bind is mounted",
+        LoginMount::None | LoginMount::Disabled => "not separately mounted",
     };
-    println!("AgentCage");
-    println!("  Workspace:  {} -> {}", cwd.display(), CONTAINER_PROJECT);
-    println!("  Home:       {home_line}");
-    println!("  Login:      {login_line}");
-    println!("  Host home:  {host_home_line}");
-    println!("  Network:    {network}");
-    println!("  Container:  auto-delete on exit");
-    println!();
-}
-
-fn print_agent_startup_hints(
-    podman: &PodmanInfo,
-    agent_info: &agent::AgentInfo,
-    login_mount: &LoginMount,
-) {
-    let mut printed = false;
-
-    match tool_cache_status(podman, agent_info) {
-        Ok(false) => {
-            println!(
-                "Setup: first {} run will download/install {} into the shared Podman tool cache.",
-                agent_info.name, agent_info.command
-            );
-            printed = true;
-        }
-        Ok(true) => {}
-        Err(e) => {
-            eprintln!("warning: cannot inspect cached agent tools: {e}");
-        }
-    }
-
-    if let LoginMount::Persistent {
-        agent,
-        has_saved: false,
-        ..
-    } = login_mount
-    {
-        println!(
-            "Login: no saved {agent} credentials yet; if a browser login opens, finish it and return here."
-        );
-        printed = true;
-    }
-
-    if printed {
-        println!();
-    }
+    eprintln!("AgentCage");
+    eprintln!("  Workspace:  {} -> {}", cwd.display(), CONTAINER_PROJECT);
+    eprintln!("  Home:       {home_line}");
+    eprintln!("  Login:      {login_line}");
+    eprintln!("  Host home:  {host_home_line}");
+    eprintln!("  Network:    {network}");
+    eprintln!("  Container:  auto-delete on exit");
+    eprintln!();
 }
 
 fn ensure_cage_dir(cwd: &Path) -> Result<PathBuf, String> {
@@ -870,9 +830,7 @@ fn ensure_cage_dir(cwd: &Path) -> Result<PathBuf, String> {
     }
 
     create_private_dir_all(&cage_dir)?;
-    cage_dir
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve project state directory: {e}"))
+    Ok(cage_dir)
 }
 
 fn agentcage_data_dir() -> Result<PathBuf, String> {
@@ -937,24 +895,41 @@ fn resolve_login_mount(
 
     cleanup_stale_login_staging(agent_name);
 
+    let lock = LoginLock::acquire(agent_name)?;
     let host_path = ensure_logins_dir()?.join(agent_name);
     create_private_dir_all(&host_path)?;
     harden_login_store(agent_name, &host_path, paths)?;
-    let has_saved = login_store_has_files(agent_name, &host_path, paths);
+    let host_dir = open_private_root(&host_path)?;
+    let baseline = read_login_snapshot(agent_name, &host_dir, paths)?;
 
     let staging_path = create_private_temp_dir(&format!("{LOGIN_STAGING_PREFIX}{agent_name}-"))?;
-    write_login_staging_owner(&staging_path)?;
-    if let Err(e) = copy_login_files(agent_name, &host_path, &staging_path, paths) {
-        let _ = fs::remove_dir_all(&staging_path);
-        return Err(e);
-    }
+    let prepared = (|| {
+        write_login_staging_owner(&staging_path)?;
+        let staging_dir = open_private_root(&staging_path)?;
+        for (rel, bytes) in paths.iter().zip(&baseline) {
+            if let Some(bytes) = bytes {
+                write_credential(&staging_dir, rel, bytes)?;
+            }
+        }
+        Ok(staging_dir)
+    })();
+    let staging_dir = match prepared {
+        Ok(dir) => dir,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging_path);
+            return Err(e);
+        }
+    };
 
     Ok(LoginMount::Persistent {
         agent: agent_name.to_string(),
         host_path,
         staging_path,
+        staging_dir,
         paths,
-        has_saved,
+        baseline,
+        revocation: lock.revocation,
+        retain_on_save_failure: Cell::new(false),
     })
 }
 
@@ -981,15 +956,72 @@ fn login_paths_for_agent(agent_name: &str) -> &'static [&'static str] {
     }
 }
 
-fn login_store_has_files(agent_name: &str, dir: &Path, paths: &[&str]) -> bool {
-    paths.iter().any(|rel| {
-        let path = dir.join(rel);
-        matches!(
-            fs::symlink_metadata(&path),
-            Ok(meta) if meta.file_type().is_file()
-        ) && ensure_login_file_size(&path).is_ok()
-            && should_persist_login_file(agent_name, rel, &path).unwrap_or(false)
-    })
+struct LoginLock {
+    file: fs::File,
+    revocation: u64,
+}
+
+impl LoginLock {
+    fn acquire(agent: &str) -> Result<Self, String> {
+        validate_login_agent(agent)?;
+        let dir = agentcage_data_dir()?.join("login-locks");
+        create_private_dir_all(&dir)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(dir.join(format!("{agent}.lock")))
+            .map_err(|e| format!("cannot open login lock for {agent}: {e}"))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("cannot inspect login lock: {e}"))?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err("refusing non-regular or hard-linked login lock".into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot secure login lock: {e}"))?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != ErrorKind::Interrupted {
+                return Err(format!("cannot lock saved login for {agent}: {e}"));
+            }
+        }
+        let mut counter = String::new();
+        (&file)
+            .take(32)
+            .read_to_string(&mut counter)
+            .map_err(|e| format!("cannot read login revocation: {e}"))?;
+        let revocation = if counter.is_empty() {
+            0
+        } else {
+            counter
+                .trim()
+                .parse()
+                .map_err(|_| "invalid login revocation counter".to_string())?
+        };
+        Ok(Self { file, revocation })
+    }
+
+    fn revoke(&mut self) -> Result<(), String> {
+        let next = self
+            .revocation
+            .checked_add(1)
+            .ok_or("login revocation counter exhausted")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(format!("{next}\n").as_bytes()))
+            .and_then(|_| self.file.set_len(format!("{next}\n").len() as u64))
+            .and_then(|_| self.file.sync_all())
+            .map_err(|e| format!("cannot revoke older login sessions: {e}"))?;
+        self.revocation = next;
+        Ok(())
+    }
 }
 
 fn create_private_temp_dir(prefix: &str) -> Result<PathBuf, String> {
@@ -1018,23 +1050,8 @@ fn create_private_temp_dir(prefix: &str) -> Result<PathBuf, String> {
 }
 
 fn create_private_dir_all(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path)
-        .map_err(|e| format!("cannot create private directory {}: {e}", path.display()))?;
-    let meta = fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot inspect private directory {}: {e}", path.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to use symlinked private directory {}",
-            path.display()
-        ));
-    }
-    if !meta.file_type().is_dir() {
-        return Err(format!(
-            "private path exists but is not a directory: {}",
-            path.display()
-        ));
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    open_directory_path(path, true)?
+        .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot set permissions on {}: {e}", path.display()))?;
     Ok(())
 }
@@ -1062,59 +1079,240 @@ fn create_private_subdir_all(root: &Path, rel: &Path) -> Result<PathBuf, String>
     Ok(current)
 }
 
-fn create_private_parent_for_rel(root: &Path, rel: &str) -> Result<(), String> {
-    let rel_path = Path::new(rel);
-    if let Some(parent) = rel_path.parent() {
-        create_private_subdir_all(root, parent)?;
-    } else {
-        create_private_dir_all(root)?;
-    }
-    Ok(())
+fn open_private_root(path: &Path) -> Result<fs::File, String> {
+    open_directory_path(path, false)
 }
 
-fn copy_private_file_atomic(src: &Path, dst: &Path) -> Result<(), String> {
-    ensure_login_file_size(src)?;
-    let parent = dst
-        .parent()
-        .ok_or_else(|| format!("cannot determine parent for {}", dst.display()))?;
-    create_private_dir_all(parent)?;
-
-    let file_name = dst
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid destination file name {}", dst.display()))?;
-
-    for _ in 0..100 {
-        let tmp = parent.join(format!(
-            ".{file_name}.agentcage-tmp-{}-{}",
-            process::id(),
-            nanoid(8)
-        ));
-        if tmp.exists() {
-            continue;
+fn open_directory_path(path: &Path, create: bool) -> Result<fs::File, String> {
+    let mut dir = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        })
+        .map_err(|e| format!("cannot open private directory base: {e}"))?;
+    for component in path.components() {
+        let part = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(part) => CString::new(part.as_bytes())
+                .map_err(|_| "invalid private directory path".to_string())?,
+            _ => {
+                return Err(format!(
+                    "invalid private directory path: {}",
+                    path.display()
+                ))
+            }
+        };
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 && create && io::Error::last_os_error().kind() == ErrorKind::NotFound {
+            if unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o700) } < 0
+                && io::Error::last_os_error().kind() != ErrorKind::AlreadyExists
+            {
+                return Err(format!(
+                    "cannot create private directory {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+            fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
         }
-
-        let copy_result = fs::copy(src, &tmp)
-            .map_err(|e| format!("cannot copy {} to {}: {e}", src.display(), tmp.display()))
-            .and_then(|_| {
-                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-                    .map_err(|e| format!("cannot set permissions on {}: {e}", tmp.display()))
-            })
-            .and_then(|_| {
-                fs::rename(&tmp, dst)
-                    .map_err(|e| format!("cannot move {} to {}: {e}", tmp.display(), dst.display()))
-            });
-
-        if let Err(e) = copy_result {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
+        if fd < 0 {
+            return Err(format!(
+                "cannot open private directory {} without following symlinks: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
         }
-        return Ok(());
+        dir = unsafe { fs::File::from_raw_fd(fd) };
     }
+    Ok(dir)
+}
 
+fn directory_for_removal(
+    root: &fs::File,
+    rel: &str,
+) -> Result<Option<(fs::File, PathBuf)>, String> {
+    let Some((parent, leaf)) = relative_parent(root, rel, false)? else {
+        return Ok(None);
+    };
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!("refusing unsafe or inaccessible state directory {rel} (symlinks are forbidden): {error}"));
+    }
+    let _selected = unsafe { fs::File::from_raw_fd(fd) };
+    // Keep the inspected parent open. Rust's Linux remove_dir_all performs its
+    // own descriptor-relative traversal and never follows nested symlinks.
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+    Ok(Some((parent, anchored)))
+}
+
+fn relative_parent(
+    root: &fs::File,
+    rel: &str,
+    create: bool,
+) -> Result<Option<(fs::File, CString)>, String> {
+    let path = Path::new(rel);
+    let mut components: Vec<_> = path.components().collect();
+    let Some(Component::Normal(leaf)) = components.pop() else {
+        return Err(format!("invalid credential path: {rel}"));
+    };
+    let leaf = CString::new(leaf.as_bytes()).map_err(|_| "invalid credential path".to_string())?;
+    let mut dir = root
+        .try_clone()
+        .map_err(|e| format!("cannot clone private directory: {e}"))?;
+    for component in components {
+        let Component::Normal(part) = component else {
+            return Err(format!("invalid credential path: {rel}"));
+        };
+        let part =
+            CString::new(part.as_bytes()).map_err(|_| "invalid credential path".to_string())?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 && io::Error::last_os_error().kind() == ErrorKind::NotFound {
+            if !create {
+                return Ok(None);
+            }
+            let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o700) };
+            if rc < 0 && io::Error::last_os_error().kind() != ErrorKind::AlreadyExists {
+                return Err(format!(
+                    "cannot create credential directory for {rel}: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        }
+        if fd < 0 {
+            return Err(format!("refusing unsafe or inaccessible credential parent for {rel} (symlinks are forbidden): {}", io::Error::last_os_error()));
+        }
+        dir = unsafe { fs::File::from_raw_fd(fd) };
+        if create {
+            dir.set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("cannot secure credential directory for {rel}: {e}"))?;
+        }
+    }
+    Ok(Some((dir, leaf)))
+}
+
+fn open_credential(root: &fs::File, rel: &str) -> Result<Option<fs::File>, String> {
+    let Some((dir, leaf)) = relative_parent(root, rel, false)? else {
+        return Ok(None);
+    };
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!(
+            "refusing unsafe or inaccessible login credential {rel}: {e}"
+        ));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect login credential {rel}: {e}"))?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(format!(
+            "refusing non-regular or hard-linked login credential {rel}"
+        ));
+    }
+    if meta.len() > MAX_LOGIN_FILE_BYTES {
+        return Err(format!(
+            "refusing oversized login credential {rel} (max {MAX_LOGIN_FILE_BYTES} bytes)"
+        ));
+    }
+    Ok(Some(file))
+}
+
+fn read_credential(root: &fs::File, rel: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(file) = open_credential(root, rel)? else {
+        return Ok(None);
+    };
+    read_open_credential(file, rel).map(Some)
+}
+
+fn read_open_credential(file: fs::File, rel: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.take(MAX_LOGIN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read login credential {rel}: {e}"))?;
+    if bytes.len() as u64 > MAX_LOGIN_FILE_BYTES {
+        return Err(format!("refusing oversized login credential {rel}"));
+    }
+    Ok(bytes)
+}
+
+fn write_credential(root: &fs::File, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let (dir, leaf) = relative_parent(root, rel, true)?.ok_or("missing credential parent")?;
+    for _ in 0..100 {
+        let temp =
+            CString::new(format!(".agentcage-tmp-{}-{}", process::id(), nanoid(12))).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                temp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(format!(
+                "cannot create credential temporary file for {rel}: {e}"
+            ));
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let result = file
+            .write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .and_then(|_| {
+                if unsafe {
+                    libc::renameat(
+                        dir.as_raw_fd(),
+                        temp.as_ptr(),
+                        dir.as_raw_fd(),
+                        leaf.as_ptr(),
+                    )
+                } == 0
+                {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+            .and_then(|_| dir.sync_all());
+        if result.is_err() {
+            unsafe {
+                libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+            }
+        }
+        return result.map_err(|e| format!("cannot save login credential {rel}: {e}"));
+    }
     Err(format!(
-        "cannot create unique temporary credential file near {}",
-        dst.display()
+        "cannot create unique credential temporary file for {rel}"
     ))
 }
 
@@ -1128,32 +1326,13 @@ fn ensure_logins_dir() -> Result<PathBuf, String> {
 
 fn harden_login_store(agent_name: &str, root: &Path, paths: &[&str]) -> Result<(), String> {
     create_private_dir_all(root)?;
+    let dir = open_private_root(root)?;
     for rel in paths {
-        let path = root.join(rel);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_file() => {
-                create_private_parent_for_rel(root, rel)?;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                    .map_err(|e| format!("cannot set permissions on {}: {e}", path.display()))?;
-                ensure_login_file_size(&path)?;
-                if !should_persist_login_file(agent_name, rel, &path)? {
-                    continue;
-                }
-            }
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(format!(
-                    "refusing to use symlinked login credential {}",
-                    path.display()
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "cannot inspect login credential {}: {e}",
-                    path.display()
-                ))
-            }
+        if let Some(file) = open_credential(&dir, rel)? {
+            // fchmod changes the inspected inode, never a reopened pathname.
+            relative_parent(&dir, rel, true)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("cannot secure saved {agent_name} login {rel}: {e}"))?;
         }
     }
     Ok(())
@@ -1163,253 +1342,928 @@ fn harden_persistent_home(home_mount: &HomeMount) -> Result<(), String> {
     let HomeMount::Persistent { host_path, .. } = home_mount else {
         return Ok(());
     };
-
     create_private_dir_all(host_path)?;
     harden_known_login_files_in_home(host_path)
 }
 
 fn harden_known_login_files_in_home(home_path: &Path) -> Result<(), String> {
-    for agent in agent::SUPPORTED_AGENTS {
-        let agent_name = agent.name;
+    let root = open_private_root(home_path)?;
+    root.set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot secure persistent home: {e}"))?;
+    for (agent_name, _) in agent::SUPPORTED_AGENTS {
         for rel in login_paths_for_agent(agent_name) {
-            let path = home_path.join(rel);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_file() => {
-                    create_private_parent_for_rel(home_path, rel)?;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| {
-                        format!("cannot set permissions on {}: {e}", path.display())
-                    })?;
-                }
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(format!(
-                        "refusing to use symlinked login credential {}",
-                        path.display()
-                    ));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(format!(
-                        "cannot inspect login credential {}: {e}",
-                        path.display()
-                    ))
-                }
+            if let Some(file) = open_credential(&root, rel)? {
+                relative_parent(&root, rel, true)?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("cannot secure {agent_name} login {rel}: {e}"))?;
             }
         }
     }
     Ok(())
 }
 
-fn copy_login_files(
-    agent_name: &str,
-    from: &Path,
-    to: &Path,
+fn read_login_snapshot(
+    agent: &str,
+    root: &fs::File,
     paths: &[&str],
-) -> Result<(), String> {
-    for rel in paths {
-        let src = from.join(rel);
-        match fs::symlink_metadata(&src) {
-            Ok(meta) if meta.file_type().is_file() => {
-                ensure_login_file_size(&src)?;
-                if !should_persist_login_file(agent_name, rel, &src)? {
-                    continue;
-                }
-                let dst = to.join(rel);
-                create_private_parent_for_rel(to, rel)?;
-                copy_private_file_atomic(&src, &dst)?;
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    paths
+        .iter()
+        .map(|rel| {
+            let Some(bytes) = read_credential(root, rel)? else {
+                return Ok(None);
+            };
+            if should_persist_login_bytes(agent, rel, &bytes)? {
+                Ok(Some(bytes))
+            } else {
+                Ok(None)
             }
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(format!(
-                    "refusing to use symlinked login credential {}",
-                    src.display()
-                ));
-            }
-            Ok(meta) if meta.file_type().is_dir() => {
-                return Err(format!(
-                    "refusing to use directory as login credential {}",
-                    src.display()
-                ));
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "refusing to use non-regular login credential {}",
-                    src.display()
-                ));
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "cannot inspect login credential {}: {e}",
-                    src.display()
-                ))
-            }
-        }
-    }
-    Ok(())
+        })
+        .collect()
 }
 
-fn should_persist_login_file(agent_name: &str, rel: &str, path: &Path) -> Result<bool, String> {
-    match (agent_name, rel) {
-        ("claude", ".claude.json") => {
-            let content = read_login_text(path)?;
-            Ok(json_key_has_value(&content, "primaryApiKey"))
+fn should_persist_login_bytes(agent: &str, rel: &str, bytes: &[u8]) -> Result<bool, String> {
+    if agent == "antigravity" {
+        return Ok(!bytes.is_empty());
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| format!("invalid UTF-8 in login credential {rel}"))?;
+    let value =
+        JsonParser::parse(text).map_err(|_| format!("invalid JSON in login credential {rel}"))?;
+    let invalid_shape =
+        || format!("invalid credential structure in {rel}; saved login was not changed");
+    let JsonValue::Object(fields) = value else {
+        return Err(invalid_shape());
+    };
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    match (agent, rel) {
+        ("codex", "auth.json" | ".codex/auth.json") => {
+            codex_auth_material(&fields).ok_or_else(invalid_shape)
         }
-        ("claude", ".claude/.credentials.json") => {
-            let content = read_login_text(path)?;
-            Ok(json_key_has_value(&content, "claudeAiOauth"))
+        ("claude", ".claude.json") => match field("primaryApiKey") {
+            None => Ok(false),
+            Some(JsonValue::String(key)) => Ok(!key.is_empty()),
+            _ => Err(invalid_shape()),
+        },
+        ("claude", ".claude/.credentials.json") => match field("claudeAiOauth") {
+            None => Ok(false),
+            Some(JsonValue::Object(tokens)) => {
+                claude_auth_material(tokens).ok_or_else(invalid_shape)
+            }
+            _ => Err(invalid_shape()),
+        },
+        ("opencode", ".local/share/opencode/account.json") => {
+            opencode_account_material(&fields).ok_or_else(invalid_shape)
         }
         ("opencode", ".local/share/opencode/auth.json") => {
-            let content = read_login_text(path)?;
-            Ok(nonempty_jsonish(&content))
+            for (_, auth) in &fields {
+                let JsonValue::Object(tokens) = auth else {
+                    return Err(invalid_shape());
+                };
+                if !valid_opencode_provider(tokens) {
+                    return Err(invalid_shape());
+                }
+            }
+            Ok(!fields.is_empty())
         }
-        ("opencode", ".local/share/opencode/account.json") => {
-            let content = read_login_text(path)?;
-            Ok(json_key_has_value(&content, "accounts"))
-        }
-        ("antigravity", ".gemini/antigravity-cli/antigravity-oauth-token") => nonempty_file(path),
-        _ => Ok(true),
+        _ => Err(invalid_shape()),
     }
 }
 
-fn read_login_text(path: &Path) -> Result<String, String> {
-    ensure_login_file_size(path)?;
-    fs::read_to_string(path)
-        .map_err(|e| format!("cannot read login credential {}: {e}", path.display()))
+#[derive(Debug)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
 }
 
-fn ensure_login_file_size(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot inspect login credential {}: {e}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to use symlinked login credential {}",
-            path.display()
-        ));
+fn json_field<'a>(fields: &'a [(String, JsonValue)], name: &str) -> Option<&'a JsonValue> {
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
+fn json_string<'a>(fields: &'a [(String, JsonValue)], name: &str) -> Option<&'a str> {
+    match json_field(fields, name) {
+        Some(JsonValue::String(value)) => Some(value),
+        _ => None,
     }
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "refusing to use non-regular login credential {}",
-            path.display()
-        ));
+}
+
+fn optional_json_string(fields: &[(String, JsonValue)], name: &str) -> bool {
+    matches!(
+        json_field(fields, name),
+        None | Some(JsonValue::Null | JsonValue::String(_))
+    )
+}
+
+fn nonnegative_json_integer(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Number(text) if text.parse::<f64>().is_ok_and(|number| {
+        number.is_finite() && number >= 0.0 && number.fract() == 0.0
+    }))
+}
+
+// Pinned Claude 2.1.289 writes these OAuth fields, and clears access/refresh
+// tokens on invalid_grant. An auth-free configuration remains a valid logout.
+fn claude_auth_material(fields: &[(String, JsonValue)]) -> Option<bool> {
+    let access = json_string(fields, "accessToken")?;
+    for key in [
+        "refreshToken",
+        "clientId",
+        "subscriptionType",
+        "rateLimitTier",
+    ] {
+        if !optional_json_string(fields, key) {
+            return None;
+        }
     }
-    if metadata.len() > MAX_LOGIN_FILE_BYTES {
-        return Err(format!(
-            "refusing oversized login credential {} ({} bytes; max {} bytes)",
-            path.display(),
-            metadata.len(),
-            MAX_LOGIN_FILE_BYTES
-        ));
+    for key in ["expiresAt", "refreshTokenExpiresAt"] {
+        if let Some(value) = json_field(fields, key) {
+            if !matches!(value, JsonValue::Null) && !nonnegative_json_integer(value) {
+                return None;
+            }
+        }
+    }
+    match json_field(fields, "scopes") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::Array(values))
+            if values.iter().all(|v| matches!(v, JsonValue::String(_))) => {}
+        _ => return None,
+    }
+    Some(!access.is_empty() || json_string(fields, "refreshToken").is_some_and(|v| !v.is_empty()))
+}
+
+// AuthDotJson and TokenData from pinned Codex rust-v0.160.0, login/src/auth/
+// storage.rs and login/src/token_data.rs. This checks the stored format, never
+// the token's signature, expiry against the clock, or provider acceptance.
+fn codex_auth_material(fields: &[(String, JsonValue)]) -> Option<bool> {
+    match json_field(fields, "auth_mode") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(mode))
+            if matches!(
+                mode.as_str(),
+                "apikey"
+                    | "chatgpt"
+                    | "chatgptAuthTokens"
+                    | "headers"
+                    | "agentIdentity"
+                    | "personalAccessToken"
+                    | "bedrockApiKey"
+                    | "bedrockAccessKeys"
+            ) => {}
+        _ => return None,
+    }
+    let mut material = false;
+    for key in ["OPENAI_API_KEY", "personal_access_token"] {
+        if !optional_json_string(fields, key) {
+            return None;
+        }
+        material |= json_string(fields, key).is_some_and(|value| !value.is_empty());
+    }
+    match json_field(fields, "last_refresh") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(value)) if valid_auth_timestamp(value) => {}
+        _ => return None,
+    }
+    match json_field(fields, "tokens") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::Object(tokens)) => {
+            let id = json_string(tokens, "id_token")?;
+            let access = json_string(tokens, "access_token")?;
+            let refresh = json_string(tokens, "refresh_token")?;
+            if !valid_codex_id_token(id) || !optional_json_string(tokens, "account_id") {
+                return None;
+            }
+            material |= !access.is_empty() || !refresh.is_empty();
+        }
+        _ => return None,
+    }
+    match json_field(fields, "agent_identity") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(token)) => material |= !token.trim().is_empty(),
+        Some(JsonValue::Object(identity)) => {
+            for key in [
+                "agent_runtime_id",
+                "agent_private_key",
+                "account_id",
+                "chatgpt_user_id",
+                "plan_type",
+            ] {
+                json_string(identity, key)?;
+            }
+            if !optional_json_string(identity, "email")
+                || !optional_json_string(identity, "task_id")
+                || !matches!(
+                    json_field(identity, "chatgpt_account_is_fedramp"),
+                    Some(JsonValue::Bool(_))
+                )
+            {
+                return None;
+            }
+            material |= !json_string(identity, "agent_runtime_id")?.is_empty()
+                && !json_string(identity, "agent_private_key")?.is_empty();
+        }
+        _ => return None,
+    }
+    for (key, required) in [
+        ("bedrock_api_key", &["api_key", "region"][..]),
+        (
+            "bedrock_access_keys",
+            &["access_key_id", "secret_access_key"][..],
+        ),
+    ] {
+        match json_field(fields, key) {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::Object(auth)) => {
+                for key in required {
+                    json_string(auth, key)?;
+                }
+                if key == "bedrock_access_keys" && !optional_json_string(auth, "session_token") {
+                    return None;
+                }
+                material |= required
+                    .iter()
+                    .all(|key| json_string(auth, key).is_some_and(|v| !v.is_empty()));
+            }
+            _ => return None,
+        }
+    }
+    Some(material)
+}
+
+fn valid_codex_id_token(token: &str) -> bool {
+    let mut parts = token.split('.');
+    if !parts.next().is_some_and(|p| !p.is_empty()) {
+        return false;
+    }
+    let Some(payload) = parts.next().filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    if !parts.next().is_some_and(|p| !p.is_empty()) || payload.len() % 4 == 1 {
+        return false;
+    }
+    // URL_SAFE_NO_PAD, including its zero trailing-bit requirement.
+    let mut decoded = Vec::with_capacity(payload.len() * 3 / 4);
+    let (mut bits, mut count) = (0u32, 0);
+    for byte in payload.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return false,
+        };
+        bits = (bits << 6) | u32::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            decoded.push((bits >> count) as u8);
+            bits &= (1 << count) - 1;
+        }
+    }
+    if bits != 0 {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let Ok(JsonValue::Object(claims)) = JsonParser::parse(text) else {
+        return false;
+    };
+    if !optional_json_string(&claims, "email") {
+        return false;
+    }
+    for (key, names) in [
+        ("https://api.openai.com/profile", &["email"][..]),
+        (
+            "https://api.openai.com/auth",
+            &[
+                "chatgpt_plan_type",
+                "chatgpt_user_id",
+                "user_id",
+                "chatgpt_account_id",
+            ][..],
+        ),
+    ] {
+        match json_field(&claims, key) {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::Object(values)) => {
+                if !names.iter().all(|name| optional_json_string(values, name)) {
+                    return false;
+                }
+                if key.ends_with("/auth")
+                    && !matches!(
+                        json_field(values, "chatgpt_account_is_fedramp"),
+                        None | Some(JsonValue::Bool(_))
+                    )
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn valid_auth_timestamp(value: &str) -> bool {
+    let Some(separator) = value.find(['T', 't', ' ']) else {
+        return false;
+    };
+    let (date, time) = value.split_at(separator);
+    let Some((year_month, day)) = date.rsplit_once('-') else {
+        return false;
+    };
+    let Some((year, month)) = year_month.rsplit_once('-') else {
+        return false;
+    };
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<i32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    let bytes = time[1..].as_bytes();
+    let pair = |position| {
+        bytes.get(position..position + 2).and_then(|pair: &[u8]| {
+            pair.iter()
+                .all(u8::is_ascii_digit)
+                .then(|| u32::from(pair[0] - b'0') * 10 + u32::from(pair[1] - b'0'))
+        })
+    };
+    if day == 0
+        || day > days
+        || bytes.get(2) != Some(&b':')
+        || bytes.get(5) != Some(&b':')
+        || !pair(0).is_some_and(|v| v < 24)
+        || !pair(3).is_some_and(|v| v < 60)
+        || !pair(6).is_some_and(|v| v <= 60)
+    {
+        return false;
+    }
+    let mut position = 8;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if start == position {
+            return false;
+        }
+    }
+    match bytes.get(position..) {
+        Some(b"Z" | b"z") => true,
+        Some(zone) if zone.len() == 6 && matches!(zone[0], b'+' | b'-') && zone[3] == b':' => {
+            pair(position + 1).is_some_and(|v| v < 24) && pair(position + 4).is_some_and(|v| v < 60)
+        }
+        _ => false,
+    }
+}
+
+// Match the exact auth-only document accepted by the embedded SQLite bridge.
+fn opencode_account_material(fields: &[(String, JsonValue)]) -> Option<bool> {
+    if fields.len() != 3 {
+        return None;
+    }
+    let JsonValue::Array(accounts) = json_field(fields, "accounts")? else {
+        return None;
+    };
+    if accounts.len() > 10_000 {
+        return None;
+    }
+    let mut identifiers = std::collections::HashSet::with_capacity(accounts.len());
+    for account in accounts {
+        let JsonValue::Object(row) = account else {
+            return None;
+        };
+        if row.len() != 6
+            || ["id", "email", "url", "access_token", "refresh_token"]
+                .iter()
+                .any(|key| json_string(row, key).is_none_or(str::is_empty))
+        {
+            return None;
+        }
+        match json_field(row, "token_expiry")? {
+            JsonValue::Null => {}
+            // Python json.loads distinguishes integers from floats. The
+            // bridge accepts only nullable, nonnegative signed-64-bit ints.
+            JsonValue::Number(number) if number.parse::<i64>().is_ok_and(|n| n >= 0) => {}
+            _ => return None,
+        }
+        if !identifiers.insert(json_string(row, "id")?) {
+            return None;
+        }
+    }
+    let active = match json_field(fields, "active_account_id")? {
+        JsonValue::Null => None,
+        JsonValue::String(id) if identifiers.contains(id.as_str()) => Some(id),
+        _ => return None,
+    };
+    match json_field(fields, "active_org_id")? {
+        JsonValue::Null => {}
+        JsonValue::String(org) if !org.is_empty() && active.is_some() => {}
+        _ => return None,
+    }
+    Some(!accounts.is_empty())
+}
+
+// Provider credential variants from the pinned OpenCode v1.18.34
+// packages/opencode/src/auth/index.ts. Logout removes the provider entry.
+fn valid_opencode_provider(fields: &[(String, JsonValue)]) -> bool {
+    let string = |key| matches!(json_field(fields, key), Some(JsonValue::String(_)));
+    let optional_string = |key| json_field(fields, key).is_none() || string(key);
+    match json_field(fields, "type") {
+        Some(JsonValue::String(kind)) if kind == "api" => {
+            string("key")
+                && match json_field(fields, "metadata") {
+                    None => true,
+                    Some(JsonValue::Object(values)) => values
+                        .iter()
+                        .all(|(_, value)| matches!(value, JsonValue::String(_))),
+                    _ => false,
+                }
+        }
+        Some(JsonValue::String(kind)) if kind == "oauth" => {
+            string("access")
+                && string("refresh")
+                && optional_string("accountId")
+                && optional_string("enterpriseUrl")
+                && match json_field(fields, "expires") {
+                    Some(JsonValue::Number(value)) => value.parse::<f64>().is_ok_and(|number| {
+                        number.is_finite() && number >= 0.0 && number.fract() == 0.0
+                    }),
+                    _ => false,
+                }
+        }
+        Some(JsonValue::String(kind)) if kind == "wellknown" => string("key") && string("token"),
+        _ => false,
+    }
+}
+
+// Limited credential and Podman-info JSON: bounded nesting and item count,
+// complete syntax validation, no policy/configuration language.
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    items: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn parse(text: &'a str) -> Result<JsonValue, ()> {
+        let mut parser = Self {
+            bytes: text.as_bytes(),
+            pos: 0,
+            items: 0,
+        };
+        let value = parser.value(0)?;
+        parser.space();
+        if parser.pos != parser.bytes.len() {
+            return Err(());
+        }
+        Ok(value)
+    }
+
+    fn space(&mut self) {
+        while matches!(self.bytes.get(self.pos), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+    }
+
+    fn take(&mut self, byte: u8) -> bool {
+        self.space();
+        if self.bytes.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn literal(&mut self, expected: &[u8], value: JsonValue) -> Result<JsonValue, ()> {
+        if self.bytes.get(self.pos..self.pos + expected.len()) != Some(expected) {
+            return Err(());
+        }
+        self.pos += expected.len();
+        Ok(value)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<JsonValue, ()> {
+        self.items += 1;
+        if depth > 64 || self.items > 100_000 {
+            return Err(());
+        }
+        self.space();
+        match self.bytes.get(self.pos) {
+            Some(b'n') => self.literal(b"null", JsonValue::Null),
+            Some(b't') => self.literal(b"true", JsonValue::Bool(true)),
+            Some(b'f') => self.literal(b"false", JsonValue::Bool(false)),
+            Some(b'"') => self.string().map(JsonValue::String),
+            Some(b'[') => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                if self.take(b']') {
+                    return Ok(JsonValue::Array(items));
+                }
+                loop {
+                    items.push(self.value(depth + 1)?);
+                    if self.take(b']') {
+                        break;
+                    }
+                    if !self.take(b',') {
+                        return Err(());
+                    }
+                }
+                Ok(JsonValue::Array(items))
+            }
+            Some(b'{') => {
+                self.pos += 1;
+                let mut fields = Vec::new();
+                let mut keys = std::collections::HashSet::new();
+                if self.take(b'}') {
+                    return Ok(JsonValue::Object(fields));
+                }
+                loop {
+                    self.space();
+                    let key = self.string()?;
+                    if !keys.insert(key.clone()) {
+                        return Err(());
+                    }
+                    if !self.take(b':') {
+                        return Err(());
+                    }
+                    fields.push((key, self.value(depth + 1)?));
+                    if self.take(b'}') {
+                        break;
+                    }
+                    if !self.take(b',') {
+                        return Err(());
+                    }
+                }
+                Ok(JsonValue::Object(fields))
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                let number_start = self.pos;
+                if self.bytes.get(self.pos) == Some(&b'-') {
+                    self.pos += 1;
+                }
+                match self.bytes.get(self.pos) {
+                    Some(b'0') => self.pos += 1,
+                    Some(b'1'..=b'9') => {
+                        while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                            self.pos += 1;
+                        }
+                    }
+                    _ => return Err(()),
+                }
+                if self.bytes.get(self.pos) == Some(&b'.') {
+                    self.pos += 1;
+                    let start = self.pos;
+                    while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                    if self.pos == start {
+                        return Err(());
+                    }
+                }
+                if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+                    self.pos += 1;
+                    if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
+                        self.pos += 1;
+                    }
+                    let start = self.pos;
+                    while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                    if self.pos == start {
+                        return Err(());
+                    }
+                }
+                Ok(JsonValue::Number(
+                    std::str::from_utf8(&self.bytes[number_start..self.pos])
+                        .map_err(|_| ())?
+                        .to_string(),
+                ))
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, ()> {
+        let digits = self.bytes.get(self.pos..self.pos + 4).ok_or(())?;
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(());
+        }
+        let text = std::str::from_utf8(digits).map_err(|_| ())?;
+        let value = u32::from_str_radix(text, 16).map_err(|_| ())?;
+        self.pos += 4;
+        Ok(value)
+    }
+
+    fn string(&mut self) -> Result<String, ()> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return Err(());
+        }
+        self.pos += 1;
+        let mut result = String::new();
+        loop {
+            match self.bytes.get(self.pos).copied().ok_or(())? {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(result);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    let escaped = self.bytes.get(self.pos).copied().ok_or(())?;
+                    self.pos += 1;
+                    result.push(match escaped {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\x08',
+                        b'f' => '\x0c',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let mut code = self.hex4()?;
+                            if (0xd800..=0xdbff).contains(&code) {
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(());
+                                }
+                                self.pos += 2;
+                                let low = self.hex4()?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return Err(());
+                                }
+                                code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                            }
+                            char::from_u32(code).ok_or(())?
+                        }
+                        _ => return Err(()),
+                    });
+                }
+                0..=31 => return Err(()),
+                _ => {
+                    let start = self.pos;
+                    while self
+                        .bytes
+                        .get(self.pos)
+                        .map(|b| *b >= 32 && *b != b'"' && *b != b'\\')
+                        .unwrap_or(false)
+                    {
+                        self.pos += 1;
+                    }
+                    result.push_str(
+                        std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|_| ())?,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check_login_tree(root: &fs::File, prefix: &str, paths: &[&str]) -> Result<(), String> {
+    let entries = fs::read_dir(format!("/proc/self/fd/{}", root.as_raw_fd()))
+        .map_err(|e| format!("cannot inspect saved login directory: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot inspect saved login entry: {e}"))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or("unrecognized saved login filename; store was kept")?;
+        let rel = format!("{prefix}{name}");
+        if paths.contains(&rel.as_str()) {
+            // Keep file/path validation on the same descriptor-relative path.
+            open_credential(root, name)?.ok_or("saved login changed during inspection")?;
+        } else if paths
+            .iter()
+            .any(|path| path.starts_with(&format!("{rel}/")))
+        {
+            let (child, _) = relative_parent(root, &format!("{name}/placeholder"), false)?
+                .ok_or("saved login directory changed during inspection")?;
+            check_login_tree(&child, &format!("{rel}/"), paths)?;
+        } else {
+            return Err(format!(
+                "unrecognized saved login entry {rel}; store was kept"
+            ));
+        }
     }
     Ok(())
 }
 
-fn nonempty_jsonish(content: &str) -> bool {
-    let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-    !compact.is_empty() && compact != "{}" && compact != "[]"
-}
-
-fn nonempty_file(path: &Path) -> Result<bool, String> {
-    ensure_login_file_size(path)?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot inspect login credential {}: {e}", path.display()))?;
-    Ok(metadata.len() > 0)
-}
-
-fn json_key_has_value(content: &str, key: &str) -> bool {
-    let needle = format!("\"{key}\"");
-    let mut offset = 0;
-    while let Some(relative) = content[offset..].find(&needle) {
-        let after_key = offset + relative + needle.len();
-        let Some(colon) = content[after_key..].find(':') else {
-            return false;
-        };
-        let value = content[after_key + colon + 1..].trim_start();
-        if !value.starts_with("null")
-            && !value.starts_with("\"\"")
-            && !value.starts_with("{}")
-            && !value.starts_with("[]")
-        {
-            return true;
-        }
-        offset = after_key;
+fn publish_login_snapshot(
+    host_path: &Path,
+    host: &fs::File,
+    paths: &[&str],
+    updated: &[Option<Vec<u8>>],
+) -> Result<(), String> {
+    // Build and fsync a complete sibling first. One atomic directory exchange
+    // then publishes all credentials/deletions together, including on ENOSPC.
+    // Refuse unexpected store contents rather than delete unmanaged files.
+    check_login_tree(host, "", paths)?;
+    let parent = open_private_root(host_path.parent().ok_or("missing login store parent")?)?;
+    let leaf = CString::new(
+        host_path
+            .file_name()
+            .ok_or("missing login store name")?
+            .as_bytes(),
+    )
+    .map_err(|_| "invalid login store name")?;
+    let temp = CString::new(format!(".agentcage-save-{}-{}", process::id(), nanoid(16))).unwrap();
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), temp.as_ptr(), 0o700) } != 0 {
+        return Err(format!(
+            "cannot prepare login snapshot: {}",
+            io::Error::last_os_error()
+        ));
     }
-    false
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .join(std::ffi::OsStr::from_bytes(temp.to_bytes()));
+    let mut keep_backup = false;
+    let result = (|| {
+        let (prepared, _) = relative_parent(
+            &parent,
+            &format!("{}/placeholder", temp.to_str().unwrap()),
+            false,
+        )?
+        .ok_or("prepared login snapshot disappeared")?;
+        for (rel, bytes) in paths.iter().zip(updated) {
+            if let Some(bytes) = bytes {
+                write_credential(&prepared, rel, bytes)?;
+            }
+        }
+        prepared
+            .sync_all()
+            .map_err(|e| format!("cannot sync prepared login snapshot: {e}"))?;
+        let mut selected: libc::stat = unsafe { std::mem::zeroed() };
+        let original = host
+            .metadata()
+            .map_err(|e| format!("cannot inspect saved login: {e}"))?;
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                &mut selected,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+            || selected.st_dev != original.dev()
+            || selected.st_ino != original.ino()
+        {
+            return Err("saved login directory changed before commit; store was kept".into());
+        }
+        let exchange = || unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                temp.as_ptr(),
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if exchange() != 0 {
+            return Err(format!(
+                "cannot commit login snapshot: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if let Err(error) = parent.sync_all() {
+            if exchange() != 0 {
+                keep_backup = true;
+                return Err(format!("login commit sync failed: {error}; rollback failed: {}; previous snapshot retained at {}",
+                    io::Error::last_os_error(), host_path.parent().unwrap().join(std::ffi::OsStr::from_bytes(temp.to_bytes())).display()));
+            }
+            let _ = parent.sync_all();
+            return Err(format!(
+                "login commit sync failed; previous snapshot restored: {error}"
+            ));
+        }
+        Ok(())
+    })();
+    if !keep_backup {
+        if let Err(error) = fs::remove_dir_all(&anchored) {
+            return Err(match result {
+                Ok(()) => {
+                    format!("login snapshot saved, but previous snapshot cleanup failed: {error}")
+                }
+                Err(original) => format!("{original}; temporary snapshot cleanup failed: {error}"),
+            });
+        }
+    }
+    result
 }
 
 fn finalize_login_mount(login_mount: &LoginMount) -> Result<(), String> {
     let LoginMount::Persistent {
         agent,
         host_path,
-        staging_path,
+        staging_dir,
         paths,
-        ..
+        baseline,
+        revocation,
+        staging_path,
+        retain_on_save_failure,
     } = login_mount
     else {
         return Ok(());
     };
-
-    let mut first_error = None;
-
-    for rel in *paths {
-        let src = staging_path.join(rel);
-        let dst = host_path.join(rel);
-        match fs::symlink_metadata(&src) {
-            Ok(meta) if meta.file_type().is_file() => {
-                if let Err(e) = ensure_login_file_size(&src) {
-                    first_error.get_or_insert(e);
-                    continue;
-                }
-                match should_persist_login_file(agent, rel, &src) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = fs::remove_file(&dst);
-                        continue;
-                    }
-                    Err(e) => {
-                        first_error.get_or_insert(e);
-                        continue;
-                    }
-                }
-                if let Err(e) = create_private_parent_for_rel(host_path, rel) {
-                    first_error.get_or_insert(e);
-                    continue;
-                }
-                if let Err(e) = copy_private_file_atomic(&src, &dst) {
-                    first_error.get_or_insert(e);
-                }
-            }
-            Ok(_) => {
-                eprintln!(
-                    "warning: ignoring non-regular login credential {}",
-                    src.display()
-                );
-                let _ = fs::remove_file(&dst);
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                let _ = fs::remove_file(&dst);
-            }
+    let mut validated_change = false;
+    let result = (|| {
+        // Podman/agent exit status cannot distinguish a failed copy-out from
+        // a successful export after a nonzero agent exit. Accept a snapshot
+        // only after the container helper completed every write and deletion.
+        let receipt = open_credential(staging_dir, LOGIN_STAGING_COMPLETE_FILE)?
+            .ok_or("credential export did not complete; the saved login store was kept")?;
+        let mut completion = Vec::new();
+        receipt
+            .take(9)
+            .read_to_end(&mut completion)
+            .map_err(|e| format!("cannot read credential export completion: {e}"))?;
+        if completion != b"complete\n" {
+            return Err(
+                "invalid credential export completion; the saved login store was kept".into(),
+            );
+        }
+        let lock = LoginLock::acquire(agent)?;
+        if lock.revocation != *revocation {
+            return Err(format!("login persistence skipped: saved {agent} login was removed while this session was running; start a new session to log in again"));
+        }
+        // Validate every source before touching the store. Invalid paths/content
+        // must never be interpreted as a request to delete existing credentials.
+        let updated = read_login_snapshot(agent, staging_dir, paths)?;
+        if updated == *baseline {
+            return Ok(());
+        }
+        validated_change = true;
+        create_private_dir_all(host_path)?;
+        let host = open_private_root(host_path)?;
+        let current = read_login_snapshot(agent, &host, paths)?;
+        if current == updated {
+            return Ok(());
+        }
+        if current != *baseline {
+            return Err(format!("login persistence conflict for {agent}: another session changed the saved login; the newer store was kept"));
+        }
+        publish_login_snapshot(host_path, &host, paths, &updated)
+    })();
+    let result = match result {
+        Err(error) if validated_change => {
+            retain_on_save_failure.set(true);
+            // A non-PID owner marker conservatively excludes this private,
+            // validated recovery copy from automatic stale staging cleanup.
+            let marker = write_credential(staging_dir, LOGIN_STAGING_OWNER_FILE, b"save-failed");
+            Err(format!("{error}; returned credentials retained for recovery at {}{}",
+                staging_path.display(), marker.err().map(|error| format!("; cannot mark recovery copy: {error}; normal 24-hour cleanup still applies")).unwrap_or_default()))
+        }
+        result => result,
+    };
+    result.map_err(|error| format!("failed to save login credentials for {agent}: {error}"))
+}
+fn cleanup_login_staging(login_mount: &LoginMount) -> Result<(), String> {
+    if let LoginMount::Persistent {
+        staging_path,
+        retain_on_save_failure,
+        ..
+    } = login_mount
+    {
+        if retain_on_save_failure.get() {
+            return Ok(());
+        }
+        match fs::remove_dir_all(staging_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => {
-                first_error.get_or_insert(format!(
-                    "cannot inspect login credential {}: {e}",
-                    src.display()
-                ));
+                return Err(format!(
+                    "cannot remove login staging {}: {e}",
+                    staging_path.display()
+                ))
             }
         }
     }
-
-    cleanup_login_staging(login_mount);
-
-    if let Some(e) = first_error {
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-fn cleanup_login_staging(login_mount: &LoginMount) {
-    if let LoginMount::Persistent { staging_path, .. } = login_mount {
-        let _ = fs::remove_dir_all(staging_path);
-    }
+    Ok(())
 }
 
 fn cleanup_stale_login_staging(agent_name: &str) {
@@ -1496,25 +2350,34 @@ fn cleanup_stale_login_staging_in(
 }
 
 fn write_login_staging_owner(staging_path: &Path) -> Result<(), String> {
-    let owner_file = staging_path.join(LOGIN_STAGING_OWNER_FILE);
-    fs::write(&owner_file, process::id().to_string()).map_err(|e| {
-        format!(
-            "cannot write login staging owner {}: {e}",
-            owner_file.display()
-        )
-    })?;
-    fs::set_permissions(&owner_file, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot set permissions on {}: {e}", owner_file.display()))?;
-    Ok(())
+    let root = open_private_root(staging_path)?;
+    write_credential(
+        &root,
+        LOGIN_STAGING_OWNER_FILE,
+        process::id().to_string().as_bytes(),
+    )
 }
 
 fn login_staging_owner_alive(staging_path: &Path) -> bool {
-    let owner_file = staging_path.join(LOGIN_STAGING_OWNER_FILE);
-    let Ok(content) = fs::read_to_string(owner_file) else {
-        return false;
+    // Unsafe or unreadable owner metadata must not block on a FIFO or permit
+    // deletion of a directory that may still belong to an active session.
+    let Ok(root) = open_private_root(staging_path) else {
+        return true;
+    };
+    let file = match open_credential(&root, LOGIN_STAGING_OWNER_FILE) {
+        Ok(Some(file)) => file,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    let mut content = Vec::new();
+    if file.take(33).read_to_end(&mut content).is_err() || content.len() > 32 {
+        return true;
+    }
+    let Ok(content) = std::str::from_utf8(&content) else {
+        return true;
     };
     let Ok(pid) = content.trim().parse::<libc::pid_t>() else {
-        return false;
+        return true;
     };
     if pid <= 0 {
         return false;
@@ -1527,51 +2390,13 @@ fn login_staging_owner_alive(staging_path: &Path) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-const AGENT_TOOLS_VOLUME: &str = "agentcage-tools";
-const AGENT_TOOLS_DST: &str = "/opt/agent-tools";
-const AGENT_TOOLS_INIT_SCRIPT: &str = r#"
-set -eu
-mkdir -p /opt/agent-tools/bin /opt/agent-tools/lib /opt/agent-tools/lib/node_modules
-chmod 0777 /opt/agent-tools /opt/agent-tools/bin /opt/agent-tools/lib /opt/agent-tools/lib/node_modules
-"#;
-
-fn agent_tools_mount() -> String {
-    format!("type=volume,src={AGENT_TOOLS_VOLUME},dst={AGENT_TOOLS_DST}")
-}
-
-fn ensure_tool_cache_volume(podman: &PodmanInfo) -> Result<(), String> {
-    let status = Command::new(&podman.executable)
-        .arg("run")
-        .arg("--rm")
-        .arg("--user")
-        .arg("0:0")
-        .arg("--mount")
-        .arg(agent_tools_mount())
-        .arg(IMAGE)
-        .arg("sh")
-        .arg("-lc")
-        .arg(AGENT_TOOLS_INIT_SCRIPT)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("podman run failed while preparing tool cache volume: {e}"))?;
-
-    if !status.success() {
-        return Err("could not prepare the shared tool cache volume".into());
-    }
-
-    Ok(())
-}
-
 fn build_run_argv(
     cwd: &Path,
-    agent_info: Option<&agent::AgentInfo>,
-    extra_args: &[String],
-    is_shell: bool,
+    command: &str,
+    extra_args: &[OsString],
     home_mount: &HomeMount,
     login_mount: &LoginMount,
-) -> Result<(Vec<String>, String), String> {
+) -> Result<(Vec<OsString>, String), String> {
     let project_src = cwd
         .canonicalize()
         .map_err(|e| format!("cannot resolve project path: {e}"))?;
@@ -1585,13 +2410,16 @@ fn build_run_argv(
 
     let mut argv = vec![PODMAN.to_string(), "run".to_string(), "--rm".to_string()];
 
-    if is_shell || has_terminal() {
-        argv.push("-it".to_string());
+    argv.push("-i".to_string());
+    if has_terminal() {
+        argv.push("-t".to_string());
     }
 
     argv.extend([
         "--name".to_string(),
         container_name.clone(),
+        "--label".to_string(),
+        CONTAINER_OWNER_LABEL.to_string(),
         "--cap-drop=ALL".to_string(),
         "--security-opt=no-new-privileges".to_string(),
         "--pids-limit=256".to_string(),
@@ -1609,7 +2437,7 @@ fn build_run_argv(
         format!("type=bind,src={path_str},dst={CONTAINER_PROJECT},rw=true,relabel=shared"),
         "--mount".to_string(),
         format!(
-            "type=tmpfs,destination={CONTAINER_CAGE_DIR},tmpfs-size=64M,tmpfs-mode=0700,U=true"
+            "type=tmpfs,destination={CONTAINER_CAGE_DIR},tmpfs-size=64M,tmpfs-mode=0700,U=true,notmpcopyup"
         ),
         "--workdir".to_string(),
         CONTAINER_PROJECT.to_string(),
@@ -1619,7 +2447,7 @@ fn build_run_argv(
         HomeMount::Disposable => {
             argv.push("--mount".to_string());
             argv.push(format!(
-                "type=tmpfs,destination={CONTAINER_HOME},tmpfs-size=512M,tmpfs-mode=0700,U=true"
+                "type=tmpfs,destination={CONTAINER_HOME},tmpfs-size=512M,tmpfs-mode=0700,U=true,notmpcopyup"
             ));
         }
         HomeMount::Persistent { host_path, .. } => {
@@ -1645,44 +2473,14 @@ fn build_run_argv(
         ));
     }
 
-    // Named volume for agent tools — persists installed agents across runs
-    argv.push("--mount".to_string());
-    argv.push(agent_tools_mount());
-
     for (key, value) in RUNTIME_ENV_VARS {
         argv.push("-e".to_string());
         argv.push(format!("{key}={value}"));
     }
 
     argv.push(IMAGE.to_string());
-
-    // Build the command to run inside the container.
-    // For agent runs, wrap with agentcage-ensure for lazy installation.
-    // For shell, just run bash directly.
-    let command = if is_shell {
-        "bash"
-    } else if let Some(info) = agent_info {
-        info.command
-    } else {
-        return Err("no agent or shell specified".into());
-    };
-
-    // Build the actual command args (possibly wrapped with install check)
-    let ensure_args: Option<Vec<String>> = agent_info.map(|info| {
-        let (itype, target) = match info.install {
-            agent::AgentInstall::Npm(pkg) => ("npm", pkg.to_string()),
-            agent::AgentInstall::Script(cmd) => ("script", cmd.to_string()),
-        };
-        vec![
-            "agentcage-ensure".to_string(),
-            info.command.to_string(),
-            itype.to_string(),
-            target,
-        ]
-    });
-
     match login_mount {
-        LoginMount::Persistent { paths, .. } => {
+        LoginMount::Persistent { agent, paths, .. } => {
             argv.push("bash".to_string());
             argv.push("-c".to_string());
             argv.push(LOGIN_SYNC_SCRIPT.to_string());
@@ -1691,21 +2489,34 @@ fn build_run_argv(
             argv.push(MAX_LOGIN_FILE_BYTES.to_string());
             argv.push(paths.len().to_string());
             argv.extend(paths.iter().map(|path| path.to_string()));
-            if let Some(ensure) = ensure_args {
-                argv.extend(ensure);
-            }
-            argv.push(command.to_string());
-            argv.extend(extra_args.iter().cloned());
+            argv.push(
+                if agent == "opencode" {
+                    OPENCODE_ACCOUNT_BRIDGE
+                } else {
+                    ""
+                }
+                .to_string(),
+            );
+            argv.push(LOGIN_FILE_SYNC.to_string());
         }
-        LoginMount::None | LoginMount::Disabled => {
-            if let Some(ensure) = ensure_args {
-                argv.extend(ensure);
-            }
-            argv.push(command.to_string());
-            argv.extend(extra_args.iter().cloned());
-        }
+        LoginMount::None | LoginMount::Disabled => {}
     }
 
+    let mut argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
+    if extra_args.iter().any(|arg| arg.to_str().is_none()) {
+        argv.extend(["python3", "-c", OPAQUE_ARGV_EXEC, command].map(OsString::from));
+        for arg in extra_args {
+            let chunks = arg.as_bytes().chunks(32 * 1024);
+            argv.push(chunks.len().to_string().into());
+            for chunk in chunks {
+                let encoded: String = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+                argv.push(encoded.into());
+            }
+        }
+    } else {
+        argv.push(command.into());
+        argv.extend_from_slice(extra_args);
+    }
     Ok((argv, container_name))
 }
 
@@ -1733,13 +2544,14 @@ fn container_network() -> &'static str {
 }
 
 fn run_podman(
-    argv: &[String],
+    argv: &[OsString],
     container_name: &str,
     login_mount: &LoginMount,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let Some((program, args)) = argv.split_first() else {
         return Err("empty command".into());
     };
+    let signals = SignalForwarder::new()?;
 
     let mut child = Command::new(program)
         .args(args)
@@ -1747,10 +2559,8 @@ fn run_podman(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            cleanup_login_staging(login_mount);
-            format!("cannot start podman: {e}")
-        })?;
+        .map_err(|e| format!("cannot start podman: {e}"))?;
+    signals.attach(child.id() as i32);
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -1761,46 +2571,115 @@ fn run_podman(
     let status = match child.wait() {
         Ok(status) => status,
         Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
-            cleanup_login_staging(login_mount);
             return Err(format!("podman exited with error: {e}"));
         }
     };
+    PODMAN_CHILD_PID.store(0, Ordering::SeqCst);
 
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    let stdout_result = stdout_thread
+        .join()
+        .map_err(|_| "stdout forwarding thread failed".to_string())
+        .and_then(|result| result.map_err(|e| format!("cannot forward container stdout: {e}")));
+    let stderr_result = stderr_thread
+        .join()
+        .map_err(|_| "stderr forwarding thread failed".to_string())
+        .and_then(|result| result.map_err(|e| format!("cannot forward container stderr: {e}")));
 
-    finalize_login_mount(login_mount)?;
-
-    if !status.success() {
-        let code = status.code().unwrap_or(1);
-        if code == 130 {
-            return Ok(());
-        }
-        let _ = Command::new(PODMAN)
-            .args(["rm", "-f", container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        return Err(format!("container command exited with status {code}"));
+    let finalization = finalize_login_mount(login_mount);
+    let mut code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
+    let interrupted = FORWARDED_SIGNAL.load(Ordering::SeqCst);
+    if code == 0 && interrupted != 0 {
+        code = 128 + interrupted;
     }
-
-    Ok(())
+    // --rm owns normal teardown. Never force-remove a possibly running container.
+    if code != 0 {
+        eprintln!("container {container_name} exited with status {code}");
+    }
+    let result = combine_session_result(Ok(code), finalization);
+    combine_session_result(result, stdout_result.and(stderr_result))
 }
 
-fn forward_stream<R: Read, W: io::Write>(mut reader: R, mut writer: W) {
+static PODMAN_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+static FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn forward_signal(signal: libc::c_int) {
+    FORWARDED_SIGNAL.store(signal, Ordering::SeqCst);
+    let pid = PODMAN_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+struct SignalForwarder {
+    previous: Vec<(i32, libc::sigaction)>,
+}
+
+impl SignalForwarder {
+    fn new() -> Result<Self, String> {
+        PODMAN_CHILD_PID.store(0, Ordering::SeqCst);
+        FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+        let mut guard = Self {
+            previous: Vec::new(),
+        };
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = forward_signal as *const () as usize;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+            }
+            let mut previous = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+                return Err(format!(
+                    "cannot install session signal handler: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            guard.previous.push((signal, previous));
+        }
+        Ok(guard)
+    }
+
+    fn attach(&self, pid: i32) {
+        PODMAN_CHILD_PID.store(pid, Ordering::SeqCst);
+        let pending = FORWARDED_SIGNAL.load(Ordering::SeqCst);
+        if pending != 0 {
+            unsafe {
+                libc::kill(pid, pending);
+            }
+        }
+    }
+}
+
+impl Drop for SignalForwarder {
+    fn drop(&mut self) {
+        PODMAN_CHILD_PID.store(0, Ordering::SeqCst);
+        for (signal, previous) in &self.previous {
+            unsafe {
+                libc::sigaction(*signal, previous, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+fn forward_stream<R: Read, W: io::Write>(mut reader: R, mut writer: W) -> io::Result<()> {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return Ok(()),
             Ok(n) => {
-                if writer.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                let _ = writer.flush();
+                writer.write_all(&buf[..n])?;
+                writer.flush()?;
             }
-            Err(_) => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
 }
@@ -1814,11 +2693,50 @@ struct PodmanInfo {
 }
 
 fn detect_podman() -> Result<PodmanInfo, String> {
+    eprintln!("AgentCage — checking Podman runtime and image...");
     let executable = find_podman()?;
     let version = podman_version(&executable)?;
-    let rootless = podman_rootless(&executable)?;
+    if !version_at_least(&version, [4, 9, 3]) {
+        return Err(format!("Podman 4.9.3 or newer is required; found '{version}'. Upgrade Podman before running {CLI}."));
+    }
+    let PodmanHost {
+        rootless,
+        remote,
+        runtime,
+        runtime_version,
+        cgroups,
+        manager,
+        controllers,
+    } = podman_host(&executable)?;
     if !rootless {
         return Err("Rootless Podman is required. Run `podman info --format '{{.Host.Security.Rootless}}'` and configure Podman rootless mode.".into());
+    }
+    if remote {
+        return Err("Local Podman is required: remote services cannot mount the caller's project and login staging paths. Use a local rootless Podman connection.".into());
+    }
+    if runtime != "crun" {
+        return Err(format!("crun is required for --group-add=keep-groups; found '{runtime}'. Configure Podman to use crun."));
+    }
+    let crun_version = runtime_version
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("crun version ")
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if !version_at_least(crun_version, [1, 14, 1]) {
+        return Err(format!("crun 1.14.1 or newer is required; found '{crun_version}'. Upgrade crun before running {CLI}."));
+    }
+    if cgroups != "v2" || manager != "systemd" {
+        return Err(format!("systemd with cgroups v2 is required for rootless resource limits; found {cgroups}/{manager}. Configure cgroups v2 and Podman's systemd cgroup manager."));
+    }
+    if !["cpu", "memory", "pids"]
+        .iter()
+        .all(|required| controllers.iter().any(|controller| controller == required))
+    {
+        return Err("rootless CPU, memory and PID controllers must be delegated to the user. Configure systemd cgroup delegation; Podman info must list cpu, memory and pids.".into());
     }
     let image_exists = podman_image_exists(&executable)?;
     let image_ready = if image_exists {
@@ -1835,47 +2753,30 @@ fn detect_podman() -> Result<PodmanInfo, String> {
     })
 }
 
-fn ensure_runtime_image(podman: &PodmanInfo) -> Result<(), String> {
-    if podman.image_ready {
-        return Ok(());
-    }
-
-    if !podman.image_exists {
-        println!("AgentCage: local runtime image not found.");
-    } else {
-        println!("AgentCage: local runtime image is outdated and will be rebuilt.");
-    }
-
-    let status = build_image(podman)?;
-    if !status.success() {
-        return Err("image build failed. check the output above".into());
-    }
-    if !podman_image_exists(&podman.executable)? {
-        return Err(format!("image '{IMAGE}' still not found after rebuild"));
-    }
-    if !podman_image_user_matches(&podman.executable)?
-        || !podman_image_hash_matches(&podman.executable)?
-    {
-        return Err(format!(
-            "image '{IMAGE}' was rebuilt but is still not ready for this host user"
-        ));
-    }
-    println!("AgentCage: runtime image ready.");
-    println!();
-    Ok(())
+fn version_at_least(version: &str, minimum: [u32; 3]) -> bool {
+    version
+        .split('.')
+        .take(3)
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.len() == 3 && parts.as_slice() >= minimum.as_slice())
+        .unwrap_or(false)
 }
 
 fn find_podman() -> Result<String, String> {
     match Command::new(PODMAN).arg("--version").output() {
-        Ok(_) => Ok(PODMAN.into()),
+        Ok(output) => {
+            check_podman_output("podman --version", &output)?;
+            Ok(PODMAN.into())
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             if Command::new("docker").arg("--version").output().is_ok() {
-                Err(format!(
-                    "Docker detected but Podman is required. {}",
-                    podman_install_hint()
-                ))
+                Err(
+                    "Docker detected but Podman is required. Install Podman: https://podman.io"
+                        .into(),
+                )
             } else {
-                Err(format!("Podman not found. {}", podman_install_hint()))
+                Err("Podman not found. Install it: https://podman.io".into())
             }
         }
         Err(e) => Err(format!("cannot check for Podman: {e}")),
@@ -1889,6 +2790,7 @@ fn podman_version(executable: &str) -> Result<String, String> {
         .arg("{{.Version}}")
         .output()
         .map_err(|e| format!("podman version failed: {e}"))?;
+    check_podman_output("podman version", &output)?;
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if version.is_empty() {
         return Err("could not determine Podman version".into());
@@ -1896,24 +2798,108 @@ fn podman_version(executable: &str) -> Result<String, String> {
     Ok(version)
 }
 
-fn podman_rootless(executable: &str) -> Result<bool, String> {
+fn podman_image_exists(executable: &str) -> Result<bool, String> {
     let output = Command::new(executable)
-        .args(["info", "--format", "{{.Host.Security.Rootless}}"])
+        .args(["image", "exists", IMAGE])
         .output()
-        .map_err(|e| format!("podman info failed: {e}"))?;
-    match String::from_utf8_lossy(&output.stdout).trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!("unexpected podman rootless value: '{other}'")),
+        .map_err(|e| format!("podman image exists failed: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => check_podman_output("podman image exists", &output).map(|_| false),
     }
 }
 
-fn podman_image_exists(executable: &str) -> Result<bool, String> {
-    let status = Command::new(executable)
-        .args(["image", "exists", IMAGE])
-        .status()
-        .map_err(|e| format!("podman image exists failed: {e}"))?;
-    Ok(status.success())
+fn check_podman_output(operation: &str, output: &process::Output) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail: String = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .chars()
+        .take(4096)
+        .collect();
+    Err(format!(
+        "{operation} failed (status {}): {}",
+        output.status,
+        if detail.is_empty() {
+            "no error detail returned"
+        } else {
+            &detail
+        }
+    ))
+}
+
+struct PodmanHost {
+    rootless: bool,
+    remote: bool,
+    runtime: String,
+    runtime_version: String,
+    cgroups: String,
+    manager: String,
+    controllers: Vec<String>,
+}
+
+fn podman_host(executable: &str) -> Result<PodmanHost, String> {
+    // One coherent host snapshot avoids repeated expensive info collection.
+    const TEMPLATE: &str = r#"{"rootless":{{json .Host.Security.Rootless}},"remote":{{json .Host.ServiceIsRemote}},"runtime":{{json .Host.OCIRuntime.Name}},"runtime_version":{{json .Host.OCIRuntime.Version}},"cgroups":{{json .Host.CgroupsVersion}},"manager":{{json .Host.CgroupManager}},"controllers":{{json .Host.CgroupControllers}}}"#;
+    let output = Command::new(executable)
+        .args(["info", "--format", TEMPLATE])
+        .output()
+        .map_err(|e| format!("podman info failed: {e}"))?;
+    check_podman_output("podman info", &output)?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "podman info returned invalid UTF-8".to_string())?;
+    parse_podman_host(text)
+}
+
+fn parse_podman_host(text: &str) -> Result<PodmanHost, String> {
+    if text.len() > 64 * 1024 {
+        return Err("podman info response exceeds 64 KiB".into());
+    }
+    let JsonValue::Object(fields) =
+        JsonParser::parse(text).map_err(|_| "podman info returned invalid JSON".to_string())?
+    else {
+        return Err("podman info returned an invalid host snapshot".into());
+    };
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    let invalid = |name: &str| {
+        format!(
+            "podman info returned a missing or invalid '{name}'; check the runtime configuration"
+        )
+    };
+    let boolean = |name: &str| match field(name) {
+        Some(JsonValue::Bool(value)) => Ok(*value),
+        _ => Err(invalid(name)),
+    };
+    let string = |name: &str| match field(name) {
+        Some(JsonValue::String(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(invalid(name)),
+    };
+    let controllers = match field("controllers") {
+        Some(JsonValue::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                JsonValue::String(value) if !value.is_empty() => Ok(value.clone()),
+                _ => Err(invalid("controllers")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(invalid("controllers")),
+    };
+    Ok(PodmanHost {
+        rootless: boolean("rootless")?,
+        remote: boolean("remote")?,
+        runtime: string("runtime")?,
+        runtime_version: string("runtime_version")?,
+        cgroups: string("cgroups")?,
+        manager: string("manager")?,
+        controllers,
+    })
 }
 
 fn podman_image_user_matches(executable: &str) -> Result<bool, String> {
@@ -1921,19 +2907,79 @@ fn podman_image_user_matches(executable: &str) -> Result<bool, String> {
         .args(["image", "inspect", IMAGE, "--format", "{{.Config.User}}"])
         .output()
         .map_err(|e| format!("podman image inspect failed: {e}"))?;
-    if !output.status.success() {
-        return Err("podman image inspect failed".into());
-    }
+    check_podman_output("podman image inspect", &output)?;
     let image_user = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(image_user == format!("{}:{}", current_uid(), current_gid()))
 }
 
 fn get_dockerfile_hash() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut s = DefaultHasher::new();
-    IMAGE_DOCKERFILE.hash(&mut s);
-    format!("{:x}", s.finish())
+    sha256_hex(IMAGE_DOCKERFILE.as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut message = bytes.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&(bytes.len() as u64 * 8).to_be_bytes());
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            words[i] = u32::from_be_bytes(word.try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = words[i - 15].rotate_right(7)
+                ^ words[i - 15].rotate_right(18)
+                ^ (words[i - 15] >> 3);
+            let s1 = words[i - 2].rotate_right(17)
+                ^ words[i - 2].rotate_right(19)
+                ^ (words[i - 2] >> 10);
+            words[i] = words[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(K[i])
+                .wrapping_add(words[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let temp2 = s0.wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (value, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *value = value.wrapping_add(add);
+        }
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 fn podman_image_hash_matches(executable: &str) -> Result<bool, String> {
@@ -1947,30 +2993,9 @@ fn podman_image_hash_matches(executable: &str) -> Result<bool, String> {
         ])
         .output()
         .map_err(|e| format!("podman image inspect failed: {e}"))?;
-    if !output.status.success() {
-        return Err("podman image inspect failed".into());
-    }
+    check_podman_output("podman image inspect", &output)?;
     let image_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(image_hash == get_dockerfile_hash())
-}
-
-fn tool_cache_status(podman: &PodmanInfo, agent_info: &agent::AgentInfo) -> Result<bool, String> {
-    let check = format!("command -v {} >/dev/null 2>&1", agent_info.command);
-    let status = Command::new(&podman.executable)
-        .arg("run")
-        .arg("--rm")
-        .arg("--mount")
-        .arg(agent_tools_mount())
-        .arg(IMAGE)
-        .arg("sh")
-        .arg("-lc")
-        .arg(check)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("podman run failed: {e}"))?;
-    Ok(status.success())
 }
 
 fn build_image(podman: &PodmanInfo) -> Result<process::ExitStatus, String> {
@@ -1980,8 +3005,7 @@ fn build_image(podman: &PodmanInfo) -> Result<process::ExitStatus, String> {
     fs::write(&dockerfile, IMAGE_DOCKERFILE)
         .map_err(|e| format!("cannot write temporary Dockerfile: {e}"))?;
 
-    println!("Step 1/2: building local runtime image {IMAGE}...");
-    println!("         This image contains the shared agent bootstrap tools.");
+    println!("building image {IMAGE}...");
     let status = Command::new(&podman.executable)
         .arg("build")
         .arg("-t")
@@ -2014,59 +3038,8 @@ fn build_image(podman: &PodmanInfo) -> Result<process::ExitStatus, String> {
     status
 }
 
-fn podman_install_hint() -> String {
-    let info = linux_distribution_info();
-    match info.id.as_deref() {
-        Some("fedora") => {
-            "AgentCage was developed on Fedora, where Podman is usually already available. If it is missing, run: sudo dnf install -y podman".into()
-        }
-        Some("ubuntu") | Some("debian") => {
-            "Install rootless Podman first, for example: sudo apt install -y podman".into()
-        }
-        Some("arch") => "Install rootless Podman first, for example: sudo pacman -S podman".into(),
-        Some("opensuse-tumbleweed") | Some("opensuse-leap") => {
-            "Install rootless Podman first, for example: sudo zypper install -y podman".into()
-        }
-        _ => {
-            if let Some(name) = info.name {
-                format!(
-                    "Install rootless Podman on {} and verify `podman info --format '{{{{.Host.Security.Rootless}}}}'` prints `true`. See https://podman.io",
-                    name
-                )
-            } else {
-                "Install rootless Podman and verify `podman info --format '{{.Host.Security.Rootless}}'` prints `true`. See https://podman.io".into()
-            }
-        }
-    }
-}
-
-struct LinuxDistributionInfo {
-    id: Option<String>,
-    name: Option<String>,
-}
-
-fn linux_distribution_info() -> LinuxDistributionInfo {
-    let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let mut id = None;
-    let mut name = None;
-
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix("ID=") {
-            id = Some(trim_os_release_value(value));
-        } else if let Some(value) = line.strip_prefix("NAME=") {
-            name = Some(trim_os_release_value(value));
-        }
-    }
-
-    LinuxDistributionInfo { id, name }
-}
-
-fn trim_os_release_value(value: &str) -> String {
-    value.trim_matches('"').to_string()
-}
-
 fn has_terminal() -> bool {
-    unsafe { libc::isatty(0) != 0 }
+    unsafe { libc::isatty(0) != 0 && libc::isatty(1) != 0 }
 }
 
 fn current_uid() -> u32 {
@@ -2096,19 +3069,22 @@ fn print_help() {
     print!(
         "AgentCage — run AI coding agents in a disposable container
 
-Only the current repo is mounted. The host home directory is not mounted.
+The current directory is mounted read-write as the project. Default login
+sync also mounts an auth-only staging directory. Host home is not separately
+mounted; choosing it as the project exposes it.
 The container is deleted on exit. Home is ephemeral by default.
 Agent login credentials are saved separately, with only auth files persisted.
 Use --env NAME to keep a full persistent container home for settings too.
 
 Requirements:
-  Linux with rootless Podman (Docker is not supported).
-  Fedora is the primary tested target; other Linux distros need Podman installed/configured first.
+  Linux x86_64 with rootless Podman (Docker is not supported).
+  Podman >= 4.9.3, crun >= 1.14.1, systemd cgroups v2 with cpu/memory/pids delegated.
   Rootless check: podman info --format '{{{{.Host.Security.Rootless}}}}' -> true
 
 Usage:
   ac
   ac <command> [options]
+  ac <agent> [--env NAME | --no-login] [-- <agent args...>]
 
 Commands:
   init          same as ac: check runtime, build image, set up project
@@ -2119,19 +3095,23 @@ Commands:
   shell         open a shell inside the cage
   env           list/remove persistent environments
   login         list/remove saved login credentials
-  clean         remove leftover containers
+  clean         remove this user's stopped, labelled AgentCage containers globally
+  completions   generate completions for bash, zsh or fish
   help          show this help
 
 Options:
   --env NAME    use full persistent environment home (.agentcage/envs/NAME/home)
   --no-login    do not sync saved agent login into this run (agent commands only)
+  --            pass all following arguments unchanged to the agent
+  --env and --no-login cannot be combined.
 
 Examples:
-  cd my-project
-  ac
-  ac opencode   # first run may install opencode into the shared tool cache
+  cd my-project &&
+  ac &&
   ac codex
   ac codex --no-login
+  ac codex -- --help
+  ac codex -- --model MODEL
   ac antigravity
   ac codex --env my-oauth
   ac env list
@@ -2162,210 +3142,238 @@ fn print_completions(shell: &str) {
 
 fn print_completions_bash() {
     print!(
-        r#"_ac_completions() {{
-    local cur prev words cword
-    _init_completion -s || return
+        "{}",
+        r#"_ac_env_names() {
+    local path name
+    for path in .agentcage/envs/* .agentcage/envs/.[!.]* .agentcage/envs/..?*; do
+        [[ -d "$path/home" && ! -L "$path" ]] || continue
+        name="${path##*/}"
+        [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] || continue
+        [[ "$name" == "$cur"* ]] && COMPREPLY+=("$name")
+    done
+}
+_ac_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]}" i has_env=0 no_login=0 needs_env=0
     COMPREPLY=()
-
-    local cmd="${{words[1]}}"
-    case "$cword" in
-        1)
-            COMPREPLY=($(compgen -W "init codex claude opencode antigravity shell env login remove clean help completions" -- "$cur"))
+    for ((i=2; i<COMP_CWORD; i++)); do
+        if (( needs_env )); then needs_env=0; continue; fi
+        case "${COMP_WORDS[i]}" in
+            --env) has_env=1; needs_env=1 ;;
+            --no-login) no_login=1 ;;
+            --) [[ "$cmd" != shell ]] && return ;;
+        esac
+    done
+    if (( COMP_CWORD == 1 )); then
+        COMPREPLY=($(compgen -W "init codex claude opencode antigravity shell env login remove clean help completions" -- "$cur"))
+        return
+    fi
+    case "$cmd" in
+        completions)
+            (( COMP_CWORD == 2 )) && COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
             ;;
-        2)
-            case "$cmd" in
-                env)
-                    COMPREPLY=($(compgen -W "list rm remove delete" -- "$cur"))
-                    ;;
-                login)
-                    COMPREPLY=($(compgen -W "list rm remove delete" -- "$cur"))
-                    ;;
-                remove)
-                    COMPREPLY=($(compgen -W "env login" -- "$cur"))
-                    ;;
-                codex|claude|opencode|antigravity)
-                    COMPREPLY=($(compgen -W "--env --no-login --help" -- "$cur"))
-                    ;;
-                shell)
-                    COMPREPLY=($(compgen -W "--env --help" -- "$cur"))
-                    ;;
-            esac
+        env|login)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=($(compgen -W "list rm remove delete" -- "$cur"))
+            elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[2]}" == rm || "${COMP_WORDS[2]}" == remove || "${COMP_WORDS[2]}" == delete ]]; then
+                if [[ "$cmd" == login ]]; then
+                    COMPREPLY=($(compgen -W "codex claude opencode antigravity" -- "$cur"))
+                else
+                    _ac_env_names
+                fi
+            fi
             ;;
-        *)
-            case "$cmd" in
-                env)
-                    if [[ "${{words[2]}}" == "rm" || "${{words[2]}}" == "remove" || "${{words[2]}}" == "delete" ]]; then
-                        if [[ -d .agentcage/envs ]]; then
-                            COMPREPLY=($(compgen -W "$(command ls -1 .agentcage/envs 2>/dev/null)" -- "$cur"))
-                        fi
-                    fi
-                    ;;
-                login)
-                    if [[ "${{words[2]}}" == "rm" || "${{words[2]}}" == "remove" || "${{words[2]}}" == "delete" ]]; then
-                        COMPREPLY=($(compgen -W "codex claude opencode antigravity" -- "$cur"))
-                    fi
-                    ;;
-                remove)
-                    if [[ "${{words[2]}}" == "env" ]]; then
-                        if [[ -d .agentcage/envs ]]; then
-                            COMPREPLY=($(compgen -W "$(command ls -1 .agentcage/envs 2>/dev/null)" -- "$cur"))
-                        fi
-                    elif [[ "${{words[2]}}" == "login" ]]; then
-                        COMPREPLY=($(compgen -W "codex claude opencode antigravity" -- "$cur"))
-                    fi
-                    ;;
-            esac
+        remove)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=($(compgen -W "env login" -- "$cur"))
+            elif (( COMP_CWORD == 3 )); then
+                case "${COMP_WORDS[2]}" in
+                    env) _ac_env_names ;;
+                    login) COMPREPLY=($(compgen -W "codex claude opencode antigravity" -- "$cur")) ;;
+                esac
+            fi
+            ;;
+        codex|claude|opencode|antigravity|shell)
+            if (( needs_env )); then _ac_env_names; return; fi
+            local options="--help"
+            [[ "$cmd" != shell ]] && options+=" --"
+            (( has_env == 0 && no_login == 0 )) && options+=" --env"
+            [[ "$cmd" != shell ]] && (( has_env == 0 && no_login == 0 )) && options+=" --no-login"
+            COMPREPLY=($(compgen -W "$options" -- "$cur"))
             ;;
     esac
-}} && complete -F _ac_completions ac
+    return 0
+}
+complete -F _ac_completions ac
 "#
     );
 }
 
 fn print_completions_zsh() {
     print!(
-        r#"#compdef ac
-
-_ac() {{
-    _arguments -C \
-        '1: :_ac_cmds' \
-        '2: :_ac_subcmds' \
-        '*:: :->args'
-
-    case "$state" in
-        args)
-            local cmd="$words[1]"
-            case "$cmd" in
-                (codex|claude|opencode|antigravity)
-                    _arguments \
-                        '--env[persistent environment name]:environment name:' \
-                        '--no-login[do not sync saved login into this run]'
-                    ;;
-                (shell)
-                    _arguments \
-                        '--env[persistent environment name]:environment name:'
-                    ;;
-                (env)
-                    case "$words[2]" in
-                        (rm|remove|delete)
-                            _arguments '3:environment name:'
-                            ;;
-                    esac
-                    ;;
-                (login)
-                    case "$words[2]" in
-                        (rm|remove|delete)
-                            _arguments '3:agent:(codex claude opencode antigravity)'
-                            ;;
-                    esac
-                    ;;
-                (remove)
-                    case "$words[2]" in
-                        (env)
-                            _arguments '3:environment name:'
-                            ;;
-                        (login)
-                            _arguments '3:agent:(codex claude opencode antigravity)'
-                            ;;
-                    esac
-                    ;;
-            esac
-            ;;
-    esac
-}}
-
-_ac_cmds() {{
-    _values 'command' \
-        'init[check runtime and build image]' \
-        'codex[run Codex CLI]' \
-        'claude[run Claude Code]' \
-        'opencode[run Opencode]' \
-        'antigravity[run Google Antigravity CLI]' \
-        'shell[open a shell in the cage]' \
-        'env[list/remove persistent environments]' \
-        'login[list/remove saved logins]' \
-        'remove[alias command for removals]' \
-        'clean[remove leftover containers]' \
-        'help[show help]' \
-        'completions[generate shell completions]'
-}}
-
-_ac_subcmds() {{
-    local cmd="$words[1]"
+        "{}",
+        r#"# Direct source setup, including clean Zsh sessions.
+if (( ! $+functions[compdef] )); then
+    autoload -Uz compinit
+    compinit -D
+fi
+_ac_env_names() {
+    local path name
+    local -a names
+    for path in .agentcage/envs/*(ND/); do
+        name="${path:t}"
+        [[ -d "$path/home" && ! -L "$path" && "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] && names+=("$name")
+    done
+    compadd -a names
+}
+_ac() {
+    local cmd="${words[2]}" i has_env=0 no_login=0 needs_env=0
+    local -a options
+    for ((i=3; i<CURRENT; i++)); do
+        if (( needs_env )); then needs_env=0; continue; fi
+        case "${words[i]}" in
+            --env) has_env=1; needs_env=1 ;;
+            --no-login) no_login=1 ;;
+            --) [[ "$cmd" != shell ]] && return 0 ;;
+        esac
+    done
+    if (( CURRENT == 2 )); then
+        compadd init codex claude opencode antigravity shell env login remove clean help completions
+        return
+    fi
     case "$cmd" in
-        (env)
-            _values 'env command' \
-                'list[list persistent environments]' \
-                'rm[remove persistent environment]' \
-                'remove[remove persistent environment]' \
-                'delete[remove persistent environment]'
+        completions) (( CURRENT == 3 )) && compadd bash zsh fish ;;
+        env|login)
+            if (( CURRENT == 3 )); then
+                compadd list rm remove delete
+            elif (( CURRENT == 4 )) && [[ "${words[3]}" == rm || "${words[3]}" == remove || "${words[3]}" == delete ]]; then
+                if [[ "$cmd" == login ]]; then compadd codex claude opencode antigravity; else _ac_env_names; fi
+            fi
             ;;
-        (login)
-            _values 'login command' \
-                'list[list saved logins]' \
-                'rm[remove saved login]' \
-                'remove[remove saved login]' \
-                'delete[remove saved login]'
+        remove)
+            if (( CURRENT == 3 )); then
+                compadd env login
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    env) _ac_env_names ;;
+                    login) compadd codex claude opencode antigravity ;;
+                esac
+            fi
             ;;
-        (remove)
-            _values 'remove target' \
-                'env[remove persistent environment]' \
-                'login[remove saved login]'
-            ;;
-        (completions)
-            _values 'shell' bash zsh fish
+        codex|claude|opencode|antigravity|shell)
+            if (( needs_env )); then _ac_env_names; return; fi
+            options=(--help)
+            [[ "$cmd" != shell ]] && options+=(--)
+            (( has_env == 0 && no_login == 0 )) && options+=(--env)
+            [[ "$cmd" != shell ]] && (( has_env == 0 && no_login == 0 )) && options+=(--no-login)
+            compadd -- "${options[@]}"
             ;;
     esac
-}}
-
-_ac
+    return 0
+}
+compdef _ac ac
 "#
     );
 }
 
 fn print_completions_fish() {
     print!(
-        r#"complete -c ac -f
+        "{}",
+        r#"complete -c ac -e
+function __ac_before_separator
+    __ac_wrapper_state before
+end
+function __ac_wrapper_state --argument-names kind
+    set -l words (commandline -opc)
+    set -l has_env 0
+    set -l no_login 0
+    set -l needs_env 0
+    set -l stopped 0
+    if contains -- "$words[2]" codex claude opencode antigravity shell
+        for word in $words[3..-1]
+            if test $needs_env -eq 1
+                set needs_env 0
+                continue
+            end
+            switch "$word"
+                case --env
+                    set has_env 1
+                    set needs_env 1
+                case --no-login
+                    set no_login 1
+                case --
+                    if test "$words[2]" != shell
+                        set stopped 1
+                        break
+                    end
+            end
+        end
+    else
+        test "$kind" = before
+        return $status
+    end
+    test $stopped -eq 0; or return 1
+    switch "$kind"
+        case before
+            return 0
+        case option
+            test $needs_env -eq 0
+        case home
+            test $needs_env -eq 0; and test $has_env -eq 0; and test $no_login -eq 0
+        case value
+            test $needs_env -eq 1
+        case agent
+            test "$words[2]" != shell
+    end
+end
+function __ac_at
+    set -l words (commandline -opc)
+    test (count $words) -eq $argv[1]; or return 1
+    if test (count $argv) -ge 2
+        test "$words[2]" = "$argv[2]"; or return 1
+    end
+    if test (count $argv) -ge 3
+        contains -- "$words[3]" $argv[3..-1]; or return 1
+    end
+end
+function __ac_env_names
+    for path in .agentcage/envs/* .agentcage/envs/.*
+        if test -d "$path/home"; and not test -L "$path"
+            set -l name (string replace -r '.*/' '' -- "$path")
+            contains -- "$name" . ..; and continue
+            string match -qr '^[a-zA-Z0-9_.-]+$' -- "$name"; and printf '%s\n' "$name"
+        end
+    end
+end
+function __ac_wrapper_option
+    __ac_wrapper_state option
+end
+function __ac_can_choose_home
+    __ac_wrapper_state home
+end
+function __ac_env_value
+    __ac_wrapper_state value
+end
 
-# subcommands
-complete -c ac -n "__fish_use_subcommand" -a init -d "check runtime and build image"
-complete -c ac -n "__fish_use_subcommand" -a codex -d "run Codex CLI"
-complete -c ac -n "__fish_use_subcommand" -a claude -d "run Claude Code"
-complete -c ac -n "__fish_use_subcommand" -a opencode -d "run Opencode"
-complete -c ac -n "__fish_use_subcommand" -a antigravity -d "run Google Antigravity CLI"
-complete -c ac -n "__fish_use_subcommand" -a shell -d "open a shell in the cage"
-complete -c ac -n "__fish_use_subcommand" -a env -d "list/remove persistent environments"
-complete -c ac -n "__fish_use_subcommand" -a login -d "list/remove saved logins"
-complete -c ac -n "__fish_use_subcommand" -a remove -d "alias command for removals"
-complete -c ac -n "__fish_use_subcommand" -a clean -d "remove leftover containers"
-complete -c ac -n "__fish_use_subcommand" -a help -d "show help"
-complete -c ac -n "__fish_use_subcommand" -a completions -d "generate shell completions"
-
-# env subcommands
-complete -c ac -n "__fish_seen_subcommand_from env; and not __fish_seen_subcommand_from list rm remove delete" -a list -d "list persistent environments"
-complete -c ac -n "__fish_seen_subcommand_from env; and not __fish_seen_subcommand_from list rm remove delete" -a rm -d "remove persistent environment"
-complete -c ac -n "__fish_seen_subcommand_from env; and not __fish_seen_subcommand_from list rm remove delete" -a remove -d "remove persistent environment"
-complete -c ac -n "__fish_seen_subcommand_from env; and not __fish_seen_subcommand_from list rm remove delete" -a delete -d "remove persistent environment"
-
-# login subcommands
-complete -c ac -n "__fish_seen_subcommand_from login; and not __fish_seen_subcommand_from list rm remove delete" -a list -d "list saved logins"
-complete -c ac -n "__fish_seen_subcommand_from login; and not __fish_seen_subcommand_from list rm remove delete" -a rm -d "remove saved login"
-complete -c ac -n "__fish_seen_subcommand_from login; and not __fish_seen_subcommand_from list rm remove delete" -a remove -d "remove saved login"
-complete -c ac -n "__fish_seen_subcommand_from login; and not __fish_seen_subcommand_from list rm remove delete" -a delete -d "remove saved login"
-complete -c ac -n "__fish_seen_subcommand_from login; and __fish_seen_subcommand_from rm remove delete" -a "codex claude opencode antigravity" -d "saved login"
-
-# remove targets
-complete -c ac -n "__fish_seen_subcommand_from remove; and not __fish_seen_subcommand_from env login" -a env -d "remove persistent environment"
-complete -c ac -n "__fish_seen_subcommand_from remove; and not __fish_seen_subcommand_from env login" -a login -d "remove saved login"
-complete -c ac -n "__fish_seen_subcommand_from remove; and __fish_seen_subcommand_from login" -a "codex claude opencode antigravity" -d "saved login"
-
-# options for agent/shell subcommands
-complete -c ac -n "__fish_seen_subcommand_from codex claude opencode antigravity shell" -l env -r -d "persistent environment name"
-complete -c ac -n "__fish_seen_subcommand_from codex claude opencode antigravity" -l no-login -d "do not sync saved login into this run"
+complete -c ac -f
+complete -c ac -n '__ac_at 1' -a 'init codex claude opencode antigravity shell env login remove clean help completions'
+complete -c ac -n '__ac_before_separator; and __ac_at 2 env' -a 'list rm remove delete'
+complete -c ac -n '__ac_before_separator; and __ac_at 2 login' -a 'list rm remove delete'
+complete -c ac -n '__ac_before_separator; and __ac_at 2 remove' -a 'env login'
+complete -c ac -n '__ac_before_separator; and __ac_at 2 completions' -a 'bash zsh fish'
+complete -c ac -n '__ac_before_separator; and __ac_at 3 login rm remove delete' -a 'codex claude opencode antigravity'
+complete -c ac -n '__ac_before_separator; and __ac_at 3 remove login' -a 'codex claude opencode antigravity'
+complete -c ac -n '__ac_before_separator; and __ac_at 3 env rm remove delete' -a '(__ac_env_names)'
+complete -c ac -n '__ac_before_separator; and __ac_at 3 remove env' -a '(__ac_env_names)'
+complete -c ac -n '__ac_can_choose_home' -l env -r -a '(__ac_env_names)' -d 'persistent environment name'
+complete -c ac -n '__ac_env_value' -a '(__ac_env_names)'
+complete -c ac -n '__ac_can_choose_home; and __ac_wrapper_state agent' -l no-login -d 'disable saved login'
+# Literal candidate also works when Fish treats a consumed --env value of --
+# as its own end-of-options marker.
+complete -c ac -n '__ac_wrapper_option' -a '--help' -d 'wrapper help'
+complete -c ac -n '__ac_wrapper_option; and __ac_wrapper_state agent' -a '--' -d 'pass following arguments to the agent'
 "#
     );
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2394,12 +3402,10 @@ mod tests {
     #[test]
     fn runs_use_host_network_for_localhost_oauth_callbacks() {
         let cwd = env::current_dir().unwrap();
-        let codex_info = agent::resolve("codex").unwrap();
         let (argv, _) = build_run_argv(
             &cwd,
-            Some(codex_info),
+            "codex",
             &[],
-            false,
             &HomeMount::Disposable,
             &LoginMount::None,
         )
@@ -2407,43 +3413,41 @@ mod tests {
 
         assert!(argv.iter().any(|arg| arg == "--network=host"));
         assert!(!argv.iter().any(|arg| arg == "-p"));
-        assert!(!argv.iter().any(|arg| arg.contains("1455")));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("1455")));
     }
 
     #[test]
     fn runs_hide_project_agentcage_state_with_tmpfs() {
         let cwd = env::current_dir().unwrap();
-        let codex_info = agent::resolve("codex").unwrap();
         let (argv, _) = build_run_argv(
             &cwd,
-            Some(codex_info),
+            "codex",
             &[],
-            false,
             &HomeMount::Disposable,
             &LoginMount::None,
         )
         .unwrap();
 
-        assert!(argv
-            .iter()
-            .any(|arg| arg.contains(&format!("type=tmpfs,destination={CONTAINER_CAGE_DIR}"))));
+        assert!(argv.iter().any(|arg| arg == format!("type=tmpfs,destination={CONTAINER_CAGE_DIR},tmpfs-size=64M,tmpfs-mode=0700,U=true,notmpcopyup").as_str()));
     }
 
     #[test]
     fn no_login_runs_without_login_sync_mount_or_wrapper() {
         let cwd = env::current_dir().unwrap();
-        let codex_info = agent::resolve("codex").unwrap();
         let (argv, _) = build_run_argv(
             &cwd,
-            Some(codex_info),
+            "codex",
             &[],
-            false,
             &HomeMount::Disposable,
             &LoginMount::Disabled,
         )
         .unwrap();
 
-        assert!(!argv.iter().any(|arg| arg.contains(CONTAINER_LOGIN_SYNC)));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains(CONTAINER_LOGIN_SYNC)));
         assert!(!argv.iter().any(|arg| arg == "agentcage-login-sync"));
         assert!(argv.iter().any(|arg| arg == "codex"));
     }
@@ -2452,6 +3456,316 @@ mod tests {
     fn rejects_unknown_global_options() {
         let err = parse_err(&["--bogus"]);
         assert!(err.contains("unknown global option"));
+    }
+
+    #[test]
+    fn agent_metadata_matches_parser_and_login_paths() {
+        for (name, binary) in agent::SUPPORTED_AGENTS {
+            assert_eq!(agent::resolve(name).unwrap(), *binary);
+            let parsed = parse(&[name.to_string(), "--".into(), "--help".into()]).unwrap();
+            assert!(
+                matches!(parsed, Cmd::Agent { name: actual, args, .. } if actual == *name && args == ["--help"])
+            );
+            assert!(!login_paths_for_agent(name).is_empty());
+            for path in login_paths_for_agent(name) {
+                assert!(Path::new(path)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))));
+            }
+        }
+        assert!(parse_err(&["codex", "--env", "one", "--env", "two"]).contains("duplicate"));
+        assert!(parse_err(&["codex", "--env", "one", "--no-login"]).contains("cannot be combined"));
+        assert!(
+            parse_err(&["codex", "--model", "example"]).contains("pass agent options after '--'")
+        );
+    }
+
+    #[test]
+    fn content_hash_matches_sha256_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn credential_json_checks_structure_whitespace_and_escapes() {
+        let rel = ".local/share/opencode/account.json";
+        for content in [
+            r#"{"accounts":[],"active_account_id":null,"active_org_id":null}"#,
+            r#"{"accounts":[ ],"active_account_id":null,"active_org_id":null}"#,
+        ] {
+            assert!(
+                !should_persist_login_bytes("opencode", rel, content.as_bytes()).unwrap(),
+                "{content}"
+            );
+        }
+        for content in [
+            r#"{"accounts":[{"id":"test","email":"fixture@invalid.example","url":"https://example.invalid","access_token":"fixture-access","refresh_token":"fixture-refresh","token_expiry":null}],"active_account_id":null,"active_org_id":null}"#,
+            r#"{ "accounts" : [ { "id" : "has space and \" quote", "email":"fixture@invalid.example", "url":"https://example.invalid", "access_token":"fixture-access", "refresh_token":"fixture-refresh", "token_expiry":0 } ], "active_account_id":null,"active_org_id":null }"#,
+            r#"{"\u0061ccounts":[{"id":"\uD83D\uDE00","email":"fixture@invalid.example","url":"https://example.invalid","access_token":"fixture-access","refresh_token":"fixture-refresh","token_expiry":9223372036854775807}],"active_account_id":"\uD83D\uDE00","active_org_id":"fixture-org"}"#,
+        ] {
+            assert!(
+                should_persist_login_bytes("opencode", rel, content.as_bytes()).unwrap(),
+                "{content}"
+            );
+        }
+        for content in [
+            r#"{"accounts":[]}"#,
+            r#"{"nested":{"accounts":[{}]}}"#,
+            r#"{"accounts":[{}],"active_account_id":null,"active_org_id":null}"#,
+            r#"{"accounts":{ }}"#,
+            r#"{"accounts":false}"#,
+            r#"{"accounts":null}"#,
+            r#"{"accounts":"token"}"#,
+            r#"{"accounts":[42]}"#,
+            "false",
+            "null",
+            "[]",
+            r#"{"accounts":[}"#,
+            r#"{"accounts":[],"accounts":[{}]}"#,
+            r#"{"accounts":["\uD800"]}"#,
+            r#"{"accounts":["\u+061"]}"#,
+            r#"{"accounts":[01]}"#,
+            r#"{"accounts":[1.]}"#,
+            "{} trailing",
+        ] {
+            assert!(
+                should_persist_login_bytes("opencode", rel, content.as_bytes()).is_err(),
+                "{content}"
+            );
+        }
+        assert!(should_persist_login_bytes(
+            "claude",
+            ".claude.json",
+            br#"{"primaryApiKey":"has space"}"#
+        )
+        .unwrap());
+        assert!(should_persist_login_bytes(
+            "claude",
+            ".claude.json",
+            br#"{"primaryApiKey":false}"#
+        )
+        .is_err());
+        assert!(should_persist_login_bytes("codex", "auth.json", &[0xff]).is_err());
+        assert!(should_persist_login_bytes("antigravity", "token", &[0xff]).unwrap());
+        assert!(should_persist_login_bytes("claude", ".claude.json", &[0xff]).is_err());
+        assert!(should_persist_login_bytes(
+            "claude",
+            ".claude.json",
+            br#"{"primaryApiKey":"fixture\u+061"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pinned_codex_auth_variants_validate_without_provider_requests() {
+        for content in [
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"fixture"}"#,
+            r#"{"tokens":{"id_token":"e30.e30.fixture","access_token":"fixture","refresh_token":"fixture","account_id":null},"last_refresh":"2024-02-29T23:59:59.123Z"}"#,
+            r#"{"auth_mode":"personalAccessToken","personal_access_token":"fixture","last_refresh":"2026-10-04T00:00:00+02:00"}"#,
+            r#"{"agent_identity":"fixture"}"#,
+            r#"{"agent_identity":{"agent_runtime_id":"fixture","agent_private_key":"fixture","account_id":"fixture","chatgpt_user_id":"fixture","email":null,"plan_type":"future-plan","chatgpt_account_is_fedramp":false}}"#,
+            r#"{"bedrock_api_key":{"api_key":"fixture","region":"us-east-1"}}"#,
+            r#"{"bedrock_access_keys":{"access_key_id":"fixture","secret_access_key":"fixture","session_token":null}}"#,
+        ] {
+            assert_eq!(
+                should_persist_login_bytes("codex", "auth.json", content.as_bytes()),
+                Ok(true),
+                "{content}"
+            );
+        }
+        for content in [r#"{}"#, r#"{"OPENAI_API_KEY":null,"tokens":null}"#] {
+            assert_eq!(
+                should_persist_login_bytes("codex", "auth.json", content.as_bytes()),
+                Ok(false)
+            );
+        }
+        for content in [
+            r#"{"OPENAI_API_KEY":42}"#,
+            r#"{"tokens":{"id_token":"e30.ZmFsc2U.fixture","access_token":"fixture","refresh_token":"fixture"}}"#,
+            r#"{"tokens":{"id_token":"e30.eyJlbWFpbCI6NDJ9.fixture","access_token":"fixture","refresh_token":"fixture"}}"#,
+            r#"{"tokens":{"id_token":"e30.e31.fixture","access_token":"fixture","refresh_token":"fixture"}}"#,
+            r#"{"OPENAI_API_KEY":"fixture","last_refresh":"2023-02-29T00:00:00Z"}"#,
+            r#"{"OPENAI_API_KEY":"fixture","last_refresh":"2026-10-04T25:00:00Z"}"#,
+            r#"{"bedrock_access_keys":{"access_key_id":"fixture","secret_access_key":false}}"#,
+            r#"{"agent_identity":{"agent_runtime_id":"fixture","agent_private_key":"fixture"}}"#,
+        ] {
+            assert!(
+                should_persist_login_bytes("codex", "auth.json", content.as_bytes()).is_err(),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn positional_agent_arguments_survive_a_later_separator() {
+        for args in [
+            vec!["codex", "exec", "--", "-"],
+            vec!["codex", "--no-login", "exec", "--", "-"],
+        ] {
+            let args: Vec<_> = args.into_iter().map(String::from).collect();
+            let Cmd::Agent { args, .. } = parse(&args).unwrap() else {
+                panic!("expected agent command");
+            };
+            assert_eq!(args, ["exec", "-"]);
+        }
+    }
+
+    #[test]
+    fn opaque_agent_arguments_survive_without_utf8_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+        let opaque = OsString::from_vec(vec![b'f', 0xff]);
+        let parsed = parse_os(&[
+            "codex".into(),
+            "--env".into(),
+            "--".into(),
+            "exec".into(),
+            "--".into(),
+            opaque.clone(),
+        ])
+        .unwrap();
+        let Cmd::Agent { env, args, .. } = parsed else {
+            panic!("expected agent");
+        };
+        assert_eq!(env.as_deref(), Some("--"));
+        assert_eq!(args, [OsString::from("exec"), opaque.clone()]);
+        assert!(parse_os(&["codex".into(), opaque]).is_err());
+    }
+
+    #[test]
+    fn podman_host_snapshot_preserves_boolean_values_and_rejects_wrong_types() {
+        let json = r#"{"rootless":true,"remote":false,"runtime":"crun","runtime_version":"crun version 1.14.1\ncommit: fixture","cgroups":"v2","manager":"systemd","controllers":["cpu","memory","pids"]}"#;
+        let host = parse_podman_host(json).unwrap();
+        assert!(host.rootless);
+        assert!(!host.remote);
+        assert_eq!(host.controllers, ["cpu", "memory", "pids"]);
+        assert!(host.runtime_version.contains('\n'));
+        for bad in [
+            json.replace("true", "\"true\""),
+            json.replace("[\"cpu\",\"memory\",\"pids\"]", "\"[cpu memory pids]\""),
+            json.replace("false", "null"),
+            "{}".to_string(),
+        ] {
+            assert!(parse_podman_host(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn anchored_credentials_reject_symlinks_special_files_and_preserve_bytes() {
+        let root = temp_test_root("anchored-credentials");
+        let outside = temp_test_root("anchored-outside");
+        create_private_dir_all(&root).unwrap();
+        create_private_dir_all(&outside).unwrap();
+        let directory = open_private_root(&root).unwrap();
+        let sentinel = outside.join("auth.json");
+        fs::write(&sentinel, "outside-fixture").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        write_credential(&directory, "auth.json", &[0xff, b'\n']).unwrap();
+        assert_eq!(
+            read_credential(&directory, "auth.json").unwrap().unwrap(),
+            [0xff, b'\n']
+        );
+        assert_eq!(mode(&root.join("auth.json")), 0o600);
+        for rel in login_paths_for_agent("opencode")
+            .iter()
+            .chain(login_paths_for_agent("antigravity"))
+        {
+            let first = Path::new(rel).components().next().unwrap().as_os_str();
+            let link = root.join(first);
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(read_credential(&directory, rel).is_err());
+            fs::remove_file(&link).unwrap();
+        }
+        for parent in [".local", ".local/share", ".local/share/opencode"] {
+            write_credential(&directory, ".local/share/opencode/auth.json", b"{}").unwrap();
+            fs::remove_dir_all(root.join(parent)).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join(parent)).unwrap();
+            assert!(read_credential(&directory, ".local/share/opencode/auth.json").is_err());
+            fs::remove_file(root.join(parent)).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, root.join(".codex")).unwrap();
+        assert!(read_credential(&directory, ".codex/auth.json").is_err());
+        assert!(harden_known_login_files_in_home(&root).is_err());
+        assert_eq!(mode(&sentinel), 0o644);
+        fs::remove_file(root.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, root.join("linked.json")).unwrap();
+        assert!(read_credential(&directory, "linked.json").is_err());
+        fs::hard_link(&sentinel, root.join("hard.json")).unwrap();
+        assert!(read_credential(&directory, "hard.json").is_err());
+        let fifo = CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_credential(&directory, "fifo").is_err());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside-fixture");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn private_directories_and_removal_stay_anchored_when_parents_change() {
+        let root = temp_test_root("state-parent");
+        let outside = temp_test_root("state-outside");
+        create_private_dir_all(&root).unwrap();
+        create_private_dir_all(&outside.join("fixture-env")).unwrap();
+        fs::write(outside.join("fixture-env/sentinel"), "outside-fixture").unwrap();
+        create_private_dir_all(&root.join("envs/fixture-env/home")).unwrap();
+        fs::write(root.join("envs/fixture-env/home/sentinel"), "owned-fixture").unwrap();
+        let dir = open_private_root(&root).unwrap();
+        let (_parent, anchored) = directory_for_removal(&dir, "envs/fixture-env")
+            .unwrap()
+            .unwrap();
+        fs::rename(root.join("envs"), root.join("original-envs")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("envs")).unwrap();
+        assert!(directory_for_removal(&dir, "envs/fixture-env").is_err());
+        assert!(create_private_dir_all(&root.join("envs/new/private")).is_err());
+        assert!(!outside.join("new").exists());
+        assert!(open_private_root(&root.join("envs/fixture-env")).is_err());
+        fs::remove_dir_all(anchored).unwrap();
+        assert!(!root.join("original-envs/fixture-env").exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("fixture-env/sentinel")).unwrap(),
+            "outside-fixture"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn anchored_file_survives_path_replacement_and_enforces_size_on_read() {
+        let root = temp_test_root("credential-replacement");
+        create_private_dir_all(&root).unwrap();
+        let dir = open_private_root(&root).unwrap();
+        write_credential(&dir, "auth.json", b"original").unwrap();
+        let mut opened = open_credential(&dir, "auth.json").unwrap().unwrap();
+        fs::rename(root.join("auth.json"), root.join("old.json")).unwrap();
+        write_credential(&dir, "auth.json", b"replacement").unwrap();
+        let mut content = Vec::new();
+        opened.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"original");
+        write_credential(&dir, "copy.json", &content).unwrap();
+        assert_eq!(
+            read_credential(&dir, "copy.json").unwrap().unwrap(),
+            b"original"
+        );
+        let large = fs::File::create(root.join("large.json")).unwrap();
+        large.set_len(MAX_LOGIN_FILE_BYTES).unwrap();
+        assert_eq!(
+            read_credential(&dir, "large.json").unwrap().unwrap().len() as u64,
+            MAX_LOGIN_FILE_BYTES
+        );
+        let opened_before_growth = open_credential(&dir, "large.json").unwrap().unwrap();
+        large.set_len(MAX_LOGIN_FILE_BYTES + 1).unwrap();
+        assert!(read_open_credential(opened_before_growth, "large.json").is_err());
+        assert!(read_credential(&dir, "large.json").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2476,7 +3790,7 @@ mod tests {
         match cmd {
             Cmd::Agent { login, args, .. } => {
                 assert_eq!(login, LoginPolicy::Disabled);
-                assert_eq!(args, vec!["--help".to_string()]);
+                assert_eq!(args, vec![OsString::from("--help")]);
             }
             _ => panic!("expected agent command"),
         }
@@ -2553,8 +3867,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_login_staging_cleanup_keeps_unsafe_owner_files_without_reading_them() {
+        let root = temp_test_root("unsafe-owner");
+        create_private_dir_all(&root).unwrap();
+        let outside = root.join("outside-marker");
+        fs::write(&outside, "fixture, not a PID").unwrap();
+        for name in ["fifo", "symlink", "oversize"] {
+            let staging = root.join(format!("{LOGIN_STAGING_PREFIX}codex-{name}"));
+            create_private_dir_all(&staging).unwrap();
+            let marker = staging.join(LOGIN_STAGING_OWNER_FILE);
+            match name {
+                "fifo" => {
+                    let path = CString::new(marker.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "symlink" => std::os::unix::fs::symlink(&outside, marker).unwrap(),
+                _ => fs::write(marker, "1".repeat(33)).unwrap(),
+            }
+            assert!(login_staging_owner_alive(&staging));
+        }
+        assert_eq!(
+            cleanup_stale_login_staging_in(&root, "codex", Duration::ZERO).unwrap(),
+            0
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "fixture, not a PID");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn antigravity_maps_to_agy_and_persists_only_token_file() {
-        assert_eq!(agent::resolve("antigravity").unwrap().command, "agy");
+        assert_eq!(agent::resolve("antigravity").unwrap(), "agy");
         assert_eq!(
             login_paths_for_agent("antigravity"),
             &[".gemini/antigravity-cli/antigravity-oauth-token"]
@@ -2570,41 +3912,6 @@ mod tests {
                 ".local/share/opencode/account.json",
             ]
         );
-    }
-
-    #[test]
-    fn agent_run_includes_tools_volume() {
-        let cwd = env::current_dir().unwrap();
-        let codex_info = agent::resolve("codex").unwrap();
-        let (argv, _) = build_run_argv(
-            &cwd,
-            Some(codex_info),
-            &[],
-            false,
-            &HomeMount::Disposable,
-            &LoginMount::None,
-        )
-        .unwrap();
-
-        assert!(argv.iter().any(|arg| arg.contains(AGENT_TOOLS_VOLUME)));
-        assert!(argv.iter().any(|arg| arg == "agentcage-ensure"));
-    }
-
-    #[test]
-    fn shell_run_has_no_install_wrapper() {
-        let cwd = env::current_dir().unwrap();
-        let (argv, _) = build_run_argv(
-            &cwd,
-            None,
-            &[],
-            true,
-            &HomeMount::Disposable,
-            &LoginMount::None,
-        )
-        .unwrap();
-
-        assert!(!argv.iter().any(|arg| arg == "agentcage-ensure"));
-        assert!(argv.iter().any(|arg| arg == "bash"));
     }
 
     #[test]
