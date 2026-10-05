@@ -1,0 +1,49 @@
+name: Release validation
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validation.yml
+    with:
+      rust: '1.85.0'
+
+  release:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: '1.85.0'
+      - name: Configure supported rootless runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman crun
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          sudo systemctl set-property "user@$(id -u).service" Delegate=yes
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build exact locked release and final image
+        run: |
+          sh scripts/package.sh
+          project=$(mktemp -d)
+          cd "$project"
+          "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/ac"
+      - name: Required live containment, resource enforcement and all-agent start
+        run: python3 scripts/smoke-podman.py --binary target/x86_64-unknown-linux-gnu/release/ac --run --required
+      - name: Preserve validated archives and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agentcage-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error

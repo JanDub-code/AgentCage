@@ -1,0 +1,44 @@
+name: Reusable source and web validation
+
+on:
+  workflow_call:
+    inputs:
+      rust:
+        description: Rust version (verified minimum or stable)
+        required: false
+        type: string
+        default: stable
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ inputs.rust }}
+      - name: Install completion shells
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - name: Locked tests, black-box contracts and exact archive release path
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/agentcage-target
+        run: sh scripts/check-source.sh
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Install pinned browser test runtime outside checkout
+        run: |
+          npm install --prefix "$RUNNER_TEMP/agentcage-web" --ignore-scripts playwright@1.62.1
+          "$RUNNER_TEMP/agentcage-web/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Actual Chromium keyboard, clipboard and reflow checks
+        env:
+          AC_WEB_NODE_MODULES: ${{ runner.temp }}/agentcage-web/node_modules
+        run: node scripts/check-web.mjs
