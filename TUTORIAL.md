@@ -1,175 +1,174 @@
 # AgentCage tutorial
 
-This guide installs `ac` and runs an agent in a contained project workspace.
+This guide installs `ac`, initializes the intended project, and starts one agent. The agent can write the project and use host networking; normal runs reuse selected saved login credentials. Use `--no-login` to skip that sync.
 
-## 1. Requirements
+## 1. Check requirements
 
-You need:
-
-- Linux
-- rootless Podman
-- Rust/Cargo only when building from source
-
-Check rootless Podman:
+You need Linux x86_64, rootless Podman 4.9.3 or newer, crun 1.14.1 or newer, and systemd cgroups v2 with delegated CPU, memory, and PID controllers. Source installation also needs Git and Rust/Cargo; curl installation adds curl. See the [requirements and validation target](README.md#requirements).
 
 ```bash
+podman version
 podman info --format '{{.Host.Security.Rootless}}'
+podman info --format '{{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}'
+podman info --format '{{.Host.CgroupsVersion}} {{.Host.CgroupManager}} {{.Host.CgroupControllers}}'
 ```
 
-Expected output:
-
-```text
-true
-```
-
-Docker is not supported.
+Rootless must print `true`; the other results must describe crun, `v2`, `systemd`, and `cpu`, `memory`, `pids`. Docker and remote/rootful Podman are not supported. Runtime preflight gives an error before agent startup when these assumptions are missing.
 
 ## 2. Install
 
-### From a release package
+Choose one path.
+
+### From a binary package
+
+Download a matching archive and checksum from the same trusted [release](https://github.com/JanDub-code/AgentCage/releases), or use a package built with `scripts/package.sh`. This exact example uses version 0.1.0:
 
 ```bash
-tar -xzf agentcage-*.tar.gz
-cd agentcage-*
+sha256sum -c agentcage-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256 &&
+tar -xzf agentcage-0.1.0-x86_64-unknown-linux-gnu.tar.gz &&
+cd agentcage-0.1.0-x86_64-unknown-linux-gnu &&
 ./install.sh --no-build
 ```
+
+Replace archive, checksum, and directory names together for another version. The exact directory works even with several archives in the download directory. Checksum verification detects corruption; it relies on a trusted source for publisher identity. Git and Rust are not needed for the binary package.
 
 ### From source
 
 ```bash
-git clone <repo-url>
-cd agentcage
+git clone https://github.com/JanDub-code/AgentCage.git AgentCage &&
+cd AgentCage &&
 ./install.sh
 ```
 
-Default install path:
-
-```text
-~/.local/bin/ac
-```
-
-Custom install path:
+This installs a locked release build from the cloned revision. The install directory is `~/.local/bin`. To choose another writable directory:
 
 ```bash
-./install.sh --bin-dir /usr/local/bin
+./install.sh --bin-dir "$HOME/bin"
 ```
 
-## 3. Ensure `ac` is in PATH
+See the [curl and Cargo Git alternatives](README.md#install). Bootstrap installation builds source and does not accept `--no-build`.
 
-For bash:
+## 3. Verify PATH
 
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-hash -r
-```
-
-For zsh:
+In the current Bash or Zsh shell, for either installation method:
 
 ```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-hash -r
-```
-
-Verify:
-
-```bash
-which ac
+export PATH="$HOME/.local/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" &&
+hash -r &&
+command -v ac &&
 ac --help
 ```
 
-## 4. Initialize a project
+For Fish, use `fish_add_path $HOME/.local/bin` for a script install, or `fish_add_path $CARGO_HOME/bin` for Cargo when `CARGO_HOME` is set (`fish_add_path $HOME/.cargo/bin` otherwise). For a custom script `--bin-dir`, add that chosen directory. To keep the Bash/Zsh setting across sessions, add it once to your shell's startup file.
 
-Go to the repository you want the agent to work on:
+## 4. Initialize the right project and start an agent
+
+Leave the AgentCage installer checkout and enter the project the agent should edit. Replace the example path with your actual project:
 
 ```bash
-cd ~/src/my-project
-ac
+cd /path/to/project &&
+ac &&
+ac codex
 ```
 
-The first run builds the local container image. This can take a while and needs network access.
+Do not choose your host home as the project: everything inside the chosen directory is exposed. The first run creates `.agentcage/` and builds `agentcage/agent-tools:local` from the embedded recipe. It needs network access and may take several minutes. `ac init` is the explicit equivalent.
 
-## 5. Run agents
+## 5. Run another session
 
 ```bash
 ac codex
-ac claude
-ac opencode
-ac antigravity
 ```
 
-Open a contained shell:
+Other choices are `ac claude`, `ac opencode`, and `ac antigravity`. For a disposable contained shell with no login sync, run `ac shell`.
 
-```bash
-ac shell
-```
-
-Pass raw arguments to an agent after `--`:
+Wrapper options come before `--`; agent options follow it:
 
 ```bash
 ac codex -- --help
+ac codex --no-login -- exec -
 ```
 
-## 6. Use safer no-login runs
+`ac codex --help` shows AgentCage help; `ac codex -- --help` shows agent help. Stdin pipes are forwarded. Agent stdout stays separate from the wrapper's stderr banner, and the agent's exit code is preserved, including interruption code 130.
 
-For untrusted prompts or tests, avoid copying saved agent credentials into the run:
+## 6. Run without saved credentials
 
 ```bash
 ac codex --no-login
 ```
 
-The agent can still edit the mounted repository, but it will not receive saved login files.
+This skips saved-login sync. Credentials already in the project remain accessible, and network access and project writes remain enabled. Container removal does not undo project changes.
 
-## 7. Manage logins
-
-Normal runs persist only allowlisted auth files for supported agents:
+## 7. Manage saved logins
 
 ```bash
 ac login list
 ac login rm codex
-ac login rm claude
-ac login rm opencode
-ac login rm antigravity
 ```
 
-See [LOGIN_PERSISTENCE.md](./LOGIN_PERSISTENCE.md).
+Replace `codex` with another supported agent to remove its store. Local removal prevents older sessions from restoring the store, but it does not revoke the token at its provider, erase credentials already copied into a running session, or clear persistent environment homes.
+
+Overlapping sessions with incompatible credential changes report a persistence conflict. Finish them and retry authentication in one fresh session. See [login persistence and recovery](LOGIN_PERSISTENCE.md#concurrent-sessions-and-local-removal).
+
+For pinned OpenCode 1.18.34 account operations:
+
+```bash
+ac opencode -- console login
+ac opencode -- console logout you@example.com
+```
+
+Replace the email with the account to remove. Default sync retains account credentials as `account.json` and provider credentials as `auth.json`; it does not save the OpenCode SQLite database or its chats/history. Real provider login and refresh are separate from synthetic adapter/logout checks and remain unverified. See [OpenCode compatibility](LOGIN_PERSISTENCE.md#opencode-11834-account-compatibility).
 
 ## 8. Optional persistent environments
 
-For trusted workflows where you want to keep the entire container home:
+For trusted workflows that need the entire container home:
 
 ```bash
 ac codex --env my-env
 ac shell --env my-env
-```
-
-Manage environments:
-
-```bash
 ac env list
 ac env rm my-env
 ```
 
-Do not use persistent environments for untrusted runs.
+Homes are project-local under `.agentcage/envs/NAME/home` and can contain credentials, settings, and caches. `--env` cannot be combined with `--no-login`. Finish sessions before removing their environment; removal deletes its home.
 
 ## 9. Shell completions
 
+Run the matching setup in that shell:
+
 ```bash
 source <(ac completions bash)
+```
+
+```zsh
+autoload -Uz compinit
+compinit
 source <(ac completions zsh)
+```
+
+```fish
 ac completions fish | source
 ```
 
-## 10. Troubleshooting old binaries
+Wrapper suggestions stop after `--`.
 
-If `ac --help` does not show the expected commands/options, your shell may be using an older binary.
+## Troubleshooting
+
+- **`ac` not found:** check `command -v ac` and the PATH step above.
+- **Unexpected help/options:** in Bash use `type -a ac` to locate older installations. Reinstall the desired build, then `hash -r`.
+- **Image missing or outdated:** run `ac` in the target project. The embedded recipe comes from the installed binary, so rebuilding the checkout alone does not update a different installed `ac`.
+- **Podman preflight failure:** inspect the printed Podman cause and requirements above. Configure rootless crun, systemd cgroups v2, and controller delegation; protections are not silently lowered.
+- **Agent option rejected:** put agent options after `--`, for example `ac codex -- --help`.
+- **Persistence conflict/local removal during a run:** finish overlapping sessions and start a fresh login-enabled session if needed. Use `--no-login` when saved auth is unwanted.
+- **Stopped container left behind:** `ac clean` removes only labelled stopped AgentCage containers for the current Podman user. It leaves running and unlabelled containers alone.
+
+To build and install the current checkout again:
 
 ```bash
-cargo build --release
-./install.sh --no-build
-hash -r
-which -a ac
+./install.sh &&
+export PATH="$HOME/.local/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" &&
+hash -r &&
+command -v ac &&
+ac --help
 ```
 
-Install to the directory that appears first in `which -a ac`.
+Read [SECURITY.md](SECURITY.md) before using untrusted agents. OAuth/refresh and additional host configurations need live checks; local file detection or a help/version launch is not that evidence.

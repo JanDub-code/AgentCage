@@ -3,150 +3,143 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub Pages](https://img.shields.io/badge/docs-github--pages-blue?logo=github)](https://jandub-code.github.io/AgentCage)
 
-AgentCage (`ac`) runs one AI coding agent inside a disposable **rootless Podman** container.
+AgentCage (`ac`) runs one coding agent against the current directory in a disposable **rootless Podman** container.
 
-**Site:** <https://jandub-code.github.io/AgentCage>
+The project is mounted **read/write**. Your host home is not separately mounted. Network access is enabled, and normal agent runs reuse selected saved login files. Project edits, the built image, and saved logins survive container removal. Use `--no-login` to omit saved credentials from a run.
 
-AgentCage started as a personal tool for testing models and coding agents from providers I do not trust enough to run directly on my host machine.
+**Site:** [AgentCage](https://jandub-code.github.io/AgentCage) · [Step-by-step tutorial](TUTORIAL.md)
 
-It is meant for the times you want to try an experimental, open-source, foreign-hosted, or otherwise high-trust-requiring coding CLI while keeping the agent focused on one repository. The agent can edit the current project, but it does **not** get your host home directory, SSH keys, cloud credentials, browser profile, or the rest of your filesystem.
-
-> AgentCage is a practical containment tool, not a VM and not a perfect sandbox. Read [the security model](#security-model) before using it with secrets or untrusted prompts.
-
-![AgentCage hero image](docs/agentcage-hero.png)
-
-> Promo artwork generated with ChatGPT.
+Rootless containers share the host kernel. Read [the security model](#security-model) before using untrusted agents or prompts. Choose a project directory, not your home directory: everything inside the chosen directory is exposed to the agent except the overlaid `.agentcage/` state directory.
 
 ## What it does
 
-- Mounts only the current directory as `/workspace/project`
-- Uses a disposable container home by default (`tmpfs`)
-- Hides `.agentcage/` from the container so saved environments are not visible through the project mount
-- Runs as your host UID/GID in rootless Podman
-- Drops Linux capabilities and uses `no-new-privileges`
-- Uses a read-only container root filesystem plus explicit writable mounts
-- Persists only allowlisted login files for supported agents, unless disabled
-- Uses host networking so OAuth localhost callbacks work
+- Mounts the current project as `/workspace/project`
+- Uses a disposable container home by default
+- Overlays project-local `.agentcage/` with an empty tmpfs
+- Runs through rootless Podman as your host UID/GID
+- Drops capabilities, uses `no-new-privileges`, and keeps the image root read-only
+- Enforces CPU, memory, and PID limits on the required cgroups configuration
+- Persists allowlisted login files for the selected agent unless disabled
+- Uses host networking, including access to host localhost services
 
-## What it does not do
-
-- It does not make the mounted repository safe from edits or deletion
-- It does not block network access
-- It does not hide credentials that are already inside the repository
-- It does not encrypt saved agent login tokens
-- It does not provide VM-grade isolation
-- It does not implement policy engines, secret scanning, audit logs, dashboards, or diff/apply workflows
+The repository remains writable, network access is unrestricted, and saved login files are not encrypted. This tool does not provide VM isolation, policy engines, secret scanning, audit logs, dashboards, or diff/apply workflows.
 
 ## Requirements
 
-- Linux
-- Rootless Podman
+The supported runtime baseline is deliberately narrow:
 
-Fedora is the primary tested target for this project. AgentCage was originally built for a Fedora workstation, where Podman is usually available by default. Ubuntu/Debian and other Linux distributions can work too, but you should expect to install and configure rootless Podman yourself first.
+| Component | Required configuration |
+| --- | --- |
+| Host | Linux x86_64 |
+| Podman | 4.9.3 or newer, local rootless mode |
+| OCI runtime | crun 1.14.1 or newer |
+| cgroups | v2, systemd manager, delegated `cpu`, `memory`, and `pids` controllers |
+| Source installation | Git and Rust/Cargo 1.85 or newer, as declared in [Cargo.toml](https://github.com/JanDub-code/AgentCage/blob/main/Cargo.toml) |
+| curl installation | Source requirements above, plus curl |
+| Binary package | POSIX shell, tar, and SHA-256 verification tools; Rust and Git are not needed |
 
-Docker is intentionally rejected. Check rootless Podman:
+Docker, remote Podman, rootful operation, runc, and cgroups v1 are rejected. The preflight checks the required configuration before starting an agent.
+
+Inspect your runtime:
 
 ```bash
+podman version
 podman info --format '{{.Host.Security.Rootless}}'
+podman info --format '{{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}'
+podman info --format '{{.Host.CgroupsVersion}} {{.Host.CgroupManager}} {{.Host.CgroupControllers}}'
 ```
 
-The command must print:
+The rootless check must print `true`; the runtime must be crun, with `v2`, `systemd`, and the three required controllers. If preflight fails, follow its diagnostic and configure the user Podman runtime before retrying.
 
-```
-true
-```
+The runtime validation target is Ubuntu 24.04 / Linux x86_64 with Podman 4.9.3, crun 1.14.1, systemd, and cgroups v2. Newer versions still need the same containment smoke checks. Native Windows/macOS, ARM, SELinux hosts, and upstream OAuth/refresh flows are not covered by that target and must not be inferred from a successful Cargo build. See [runtime validation](#runtime-validation).
 
 ## Install
 
-### Quick installation (via curl)
+### Quick installation via curl
+
+This method downloads the installer, clones this repository's current `main`, builds with the lockfile, and installs the binary. It requires Git and Rust/Cargo. The installer runs only after a successful, nonempty download.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh | bash
+install_script=$(curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh) &&
+{ [ -n "$install_script" ] || { printf '%s\n' 'Installer download was empty.' >&2; false; }; } &&
+printf '%s\n' "$install_script" | sh
 ```
 
-Pass install arguments through `curl` like this:
+To choose a directory with the bootstrap installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh | bash -s -- --bin-dir /usr/local/bin
+install_script=$(curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh) &&
+{ [ -n "$install_script" ] || { printf '%s\n' 'Installer download was empty.' >&2; false; }; } &&
+printf '%s\n' "$install_script" | sh -s -- --bin-dir "$HOME/.local/bin"
 ```
 
-### Podman bootstrap by distro
+`--no-build` requires an existing checkout build or binary package; it is rejected for bootstrap installation.
 
-Fedora usually already has Podman available. If not:
+### From a binary package
 
-```bash
-sudo dnf install -y podman
-```
-
-Ubuntu/Debian:
+Use a matching archive and checksum from the same trusted [release](https://github.com/JanDub-code/AgentCage/releases) or from `scripts/package.sh`. The example below is for version 0.1.0, Linux x86_64. Run it in the download directory containing these exact filenames:
 
 ```bash
-sudo apt install -y podman
-```
-
-After installing, verify rootless Podman:
-
-```bash
-podman info --format '{{.Host.Security.Rootless}}'
-```
-
-That command must print `true`.
-
-### From a release package
-
-```bash
-tar -xzf agentcage-*.tar.gz
-cd agentcage-*
+sha256sum -c agentcage-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256 &&
+tar -xzf agentcage-0.1.0-x86_64-unknown-linux-gnu.tar.gz &&
+cd agentcage-0.1.0-x86_64-unknown-linux-gnu &&
 ./install.sh --no-build
 ```
 
-By default this installs `ac` to `~/.local/bin`. To choose another location:
+The exact directory avoids ambiguity when an archive and extracted directory coexist or several versions have been downloaded. Replace both filenames and the directory together when selecting a different release.
+
+The package's `RELEASE` file identifies its version, target, source revision/state, binary checksum, and image recipe checksum. The installer also verifies the packaged binary against that metadata. A checksum detects corruption; it does not authenticate the publisher. Obtain the archive and checksum through a trusted release source. Release signatures are not currently provided.
+
+By default the script installs to `~/.local/bin`. To choose another writable directory:
 
 ```bash
-./install.sh --no-build --bin-dir /usr/local/bin
+./install.sh --no-build --bin-dir "$HOME/bin"
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/JanDub-code/AgentCage.git
-cd AgentCage
-./install.sh --build
+git clone https://github.com/JanDub-code/AgentCage.git AgentCage &&
+cd AgentCage &&
+./install.sh
 ```
 
-This builds locally from the GitHub checkout and installs the resulting binary.
+This builds a locked release for `x86_64-unknown-linux-gnu`. `CARGO_TARGET_DIR` is honored; otherwise the script uses the checkout's `target/`. The script explicitly selects the target and output directory, overriding Cargo configuration for those two settings. Cross-target packaging is rejected.
+
+Cargo can also install the repository directly:
+
+```bash
+cargo install --git https://github.com/JanDub-code/AgentCage.git --locked
+```
+
+Cargo installs to `${CARGO_HOME:-$HOME/.cargo}/bin`. A source installation follows the chosen Git revision; checkout a reviewed tag or commit first when fixed source inputs are required.
+
+### Verify PATH
+
+For either installation method in the current Bash/Zsh shell:
+
+```bash
+export PATH="$HOME/.local/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" &&
+hash -r &&
+command -v ac &&
+ac --help
+```
+
+Add that PATH setting to your shell's startup file if you want it to persist. It includes a custom `CARGO_HOME` when set. For a custom script `--bin-dir`, also add that chosen directory.
 
 ## Quick start
 
-Inside the repository you want the agent to work on:
+Inside the project you want the agent to work on:
 
 ```bash
-ac
+cd /path/to/project &&
+ac &&
+ac codex
 ```
 
-You can also jump straight to an agent command such as `ac opencode`; AgentCage now auto-builds the local runtime image on demand if it is missing or outdated.
+Replace `/path/to/project` with the actual project directory. The first `ac` creates `.agentcage/` and builds `agentcage/agent-tools:local` from the image recipe embedded in the binary. The build downloads tools and needs network access. `ac init` is an explicit alias. An agent command requires that image to be ready; if it is missing or the embedded recipe changed, run `ac` first.
 
-The first run creates `.agentcage/` and builds the local image:
-
-```
-agentcage/agent-tools:local
-```
-
-Then the first run of each individual agent installs that agent lazily into the shared Podman volume:
-
-```
-agentcage-tools
-```
-
-So:
-
-- first `ac` / `ac init`: builds the local runtime image
-- first `ac codex` / `ac claude` / `ac opencode` / `ac antigravity`: downloads that specific agent into the shared tool cache
-- later runs reuse the cached agent install
-
-Both steps need network access on first use.
-
-Run an agent:
+Choose one agent:
 
 ```bash
 ac codex
@@ -155,146 +148,141 @@ ac opencode
 ac antigravity
 ```
 
-Open a contained shell:
+For a disposable shell with no login sync:
 
 ```bash
 ac shell
 ```
 
-Pass arguments to an agent after `--`:
+AgentCage options come before `--`; everything after it is passed to the agent:
 
 ```bash
 ac codex -- --help
+ac codex --no-login -- exec -
 ```
 
-## Supported agents
+`ac codex --help` shows wrapper help. `ac codex -- --help` shows the agent's help. `--env NAME` and `--no-login` cannot be combined.
+
+Foreground stdin is forwarded, including pipes; a TTY is allocated only when stdin and stdout are terminals. The session banner goes to stderr so agent stdout can be captured unchanged. The child's exit status is preserved, including 130 for interruption. A wrapper or login-finalization failure returns a nonzero result; a failed finalize does not mask an already nonzero child result.
+
+## Agent commands and image updates
 
 | Command | Container binary |
-| ------- | ---------------- |
+| --- | --- |
 | `ac codex` | `codex` |
 | `ac claude` | `claude` |
 | `ac opencode` | `opencode` |
 | `ac antigravity` | `agy` |
 
-The image installs these tools from their upstream package/install channels during `ac` / `ac init`.
+The image pins its base digest, package snapshot, and agent artifacts in [Dockerfile](Dockerfile). These fixed inputs improve predictable upgrades; they are not a promise of bit-for-bit reproducible image bytes.
+
+To update tools, review the version and checksum changes, rebuild the `ac` binary, and run `ac` in your project. The embedded recipe fingerprint detects a changed recipe. Startup/version smoke checks must be repeated for every declared tool before release.
 
 ## Security model
 
-| Host path | Container path | Access |
-| --------- | -------------- | ------ |
+| Host path/state | Container path | Access |
+| --- | --- | --- |
 | current directory | `/workspace/project` | read/write |
-| `.agentcage/` | hidden by tmpfs at `/workspace/project/.agentcage` | not the host directory |
+| `.agentcage/` | empty tmpfs over `/workspace/project/.agentcage` | host state hidden through this project path |
 | container home | `/workspace/session-home` | disposable tmpfs by default |
-| host `$HOME` | not mounted | no access |
-| saved login staging | `/workspace/login-sync` | selected allowlisted auth files only |
+| host `$HOME` | no separate mount | anything under the chosen project is still exposed |
+| selected login staging | `/workspace/login-sync` | allowlisted files for the selected agent |
+| `--env NAME` home | `/workspace/session-home` | full persistent home, read/write |
 
-Important boundaries:
+- The agent can read, modify, and delete files in the mounted project. Keep backups or use a throwaway clone.
+- Host networking enables both internet access and access to services on the host.
+- Saved login credentials are available to the selected agent unless you use `--no-login`; they can be sent over the network.
+- Credentials already inside the project remain visible with `--no-login`. That option prevents saved-login sync; it does not block authentication performed inside the run.
+- Removing the container discards its disposable home, while project edits, the image, and saved state remain.
+- `--env` reuses the entire container home, including caches, settings, and any credentials.
 
-- The agent can read and modify anything in the mounted repository
-- The agent cannot normally see host `~/.ssh`, `~/.aws`, browser data, or other files outside the repository because host `$HOME` is not mounted
-- Network is enabled and uses `--network=host`; this is needed for OAuth callback flows that redirect to `localhost`
-- Saved login credentials are copied into the run for the selected agent unless you use `--no-login`
-- A malicious agent with valid login credentials can exfiltrate those credentials over the network
-- Full persistent environments (`--env`) are convenient but less isolated because the entire container home is reused
+See [SECURITY.md](SECURITY.md) and [LOGIN_PERSISTENCE.md](LOGIN_PERSISTENCE.md).
 
 ## Login persistence
 
-By default, the container home is disposable on every run, but supported agents keep only their allowlisted auth files between runs.
-
-Saved login store:
-
-```
-$XDG_DATA_HOME/agentcage/logins/<agent>
-# or
-~/.local/share/agentcage/logins/<agent>
-```
-
-How login sync works on a normal login-enabled run:
-
-1. AgentCage creates a private temporary staging directory.
-2. It copies only allowlisted auth files for that agent into the staging dir.
-3. It bind-mounts that staging dir into the container as `/workspace/login-sync`.
-4. It copies those files into `$HOME` inside the container before the agent starts.
-5. After the agent exits, it copies back only the same allowlisted files.
-6. It deletes the staging dir.
-
-Persisted auth files:
+Normal disposable-home agent runs persist only allowlisted auth files:
 
 ```text
-codex:       auth.json, .codex/auth.json
-claude:      .claude/.credentials.json, .claude.json
-opencode:    .local/share/opencode/auth.json, .local/share/opencode/account.json
-antigravity: .gemini/antigravity-cli/antigravity-oauth-token
+$XDG_DATA_HOME/agentcage/logins/<agent>
+# or, when XDG_DATA_HOME is unset:
+~/.local/share/agentcage/logins/<agent>
 ```
-
-Safety rules for saved credentials:
-
-- directories are kept private where possible (`0700`)
-- files are kept private where possible (`0600`)
-- symlinked credentials are rejected
-- non-regular files and directories are rejected
-- oversized login files are rejected
-- stale login staging directories for the same agent are cleaned up on later runs
-
-Manage saved logins:
 
 ```bash
 ac login list
 ac login rm codex
-ac login rm claude
-ac login rm opencode
-ac login rm antigravity
-```
-
-For untrusted prompts or tests, run without copying saved credentials into the container:
-
-```bash
 ac codex --no-login
 ```
 
-`--no-login` cannot be combined with `--env`, because `--env` reuses a full persistent home that may already contain credentials.
+`login list` reports recognizable locally saved files, not proof that a provider accepts a token. `login rm` removes the selected local store and prevents older open sessions from restoring it. It does not revoke provider tokens or remove credentials from persistent `--env` homes.
 
-Saved tokens are not encrypted. During a login-enabled run, the selected agent can read its token files and can send them over the network. Use separate low-privilege accounts or tokens for risky workflows.
+Concurrent sessions take snapshots. An unchanged session does not overwrite a newer login; incompatible concurrent changes produce a persistence error instead of silently replacing credentials. See [login recovery](LOGIN_PERSISTENCE.md#concurrent-sessions-and-local-removal).
+
+For pinned OpenCode 1.18.34, provider credentials still use `auth.json`. Account credentials and the selected account/organization are restored from and exported to the allowlisted `account.json`. An adapter runs inside the disposable home; its SQLite database, chats, logs, and history are not copied into the host login store. See [OpenCode account compatibility](LOGIN_PERSISTENCE.md#opencode-11834-account-compatibility) for commands and validation limits. A full `--env` home instead retains all its state.
 
 ## Full persistent environments
 
-For trusted workflows where you want to keep a whole container home, including settings and caches:
+For a trusted workflow:
 
 ```bash
 ac codex --env my-env
 ac shell --env my-env
-```
-
-Manage them:
-
-```bash
 ac env list
 ac env rm my-env
 ```
 
-Do not use `--env` for untrusted runs. A persistent home may contain credentials and other long-lived state.
+Homes live under `.agentcage/envs/NAME/home` in the current project and remain until removed. `env rm` deletes that home and its contents; finish sessions using it first. Avoid `--env` for untrusted runs.
+
+## Cleanup
+
+```bash
+ac clean
+```
+
+Cleanup is global for the current rootless Podman user. It removes only stopped containers with AgentCage's ownership label `io.agentcage.managed=true`, by ID, without forcing termination. Running containers and unlabelled older containers are left alone. A listing or removal failure returns a nonzero result.
 
 ## Shell completions
 
+For the current shell:
+
 ```bash
 source <(ac completions bash)
+```
+
+```zsh
+autoload -Uz compinit
+compinit
 source <(ac completions zsh)
+```
+
+```fish
 ac completions fish | source
 ```
 
-## Build a distribution package
+Wrapper completions stop after `--`; the agent owns arguments after that delimiter.
 
-From the repository root:
+## Build and validate a distribution package
 
 ```bash
+cargo test --locked
 scripts/package.sh
 ```
 
-The package is written to:
+The script produces `dist/agentcage-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` file. Build inputs and release target are recorded in `RELEASE`.
 
+## Runtime validation
+
+Fast tests exercise parser, process, persistence, cleanup, and installer contracts with disposable fixtures. They do not prove kernel isolation or upstream login compatibility.
+
+From a source checkout of the revision being tested, run the opt-in live containment and agent-start checks on the required runtime with [scripts/smoke-podman.py](https://github.com/JanDub-code/AgentCage/blob/main/scripts/smoke-podman.py):
+
+```bash
+python3 scripts/smoke-podman.py --binary /absolute/path/to/ac --run --required
 ```
-dist/agentcage-<version>-<target>.tar.gz
-```
+
+Replace the binary path with the tested build. The checks use their own labelled disposable fixtures and no user login store. Without `--run` they report an explicit unverified result (exit 77). `--required` makes an unavailable runtime a failure. A missing runtime is missing evidence, not a successful live test.
+
+Upstream OAuth and token refresh need dedicated test accounts and provider/browser interaction. They remain separate from help/version startup checks. Further architectures and SELinux configurations need their own live runs before being advertised as validated.
 
 ## License
 
