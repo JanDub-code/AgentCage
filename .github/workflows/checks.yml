@@ -1,0 +1,20 @@
+name: Linux checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    uses: ./.github/workflows/validation.yml
+    with:
+      rust: ${{ matrix.rust }}

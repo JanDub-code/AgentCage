@@ -1,107 +1,49 @@
-name: Release
+name: Release validation
 
 on:
   push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.meta.outputs.release_tag }}
-      release_version: ${{ steps.meta.outputs.release_version }}
-      release_name: ${{ steps.meta.outputs.release_name }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Compute release metadata
-        id: meta
-        shell: bash
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          branch="${GITHUB_REF_NAME}"
-          branch="${branch//\//-}"
-          short_sha="${GITHUB_SHA::12}"
-          release_tag="v${version}-${branch}-${short_sha}"
-          release_version="${release_tag#v}"
-          release_name="AgentCage ${version} ${branch} (${short_sha})"
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
-          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: prepare
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package binary
-        run: |
-          version="${{ needs.prepare.outputs.release_version }}"
-          package="agentcage-${version}-${{ matrix.target }}"
-          staging="dist/${package}"
-          mkdir -p "${staging}/target/release"
-          install -m 0755 "target/${{ matrix.target }}/release/ac" "${staging}/target/release/ac"
-          install -m 0755 install.sh "${staging}/install.sh"
-          install -m 0644 Cargo.toml "${staging}/Cargo.toml"
-          install -m 0644 Cargo.lock "${staging}/Cargo.lock"
-          install -m 0644 Dockerfile "${staging}/Dockerfile"
-          install -m 0644 README.md "${staging}/README.md"
-          install -m 0644 TUTORIAL.md "${staging}/TUTORIAL.md"
-          install -m 0644 LICENSE "${staging}/LICENSE"
-          mkdir -p "${staging}/src"
-          install -m 0644 src/*.rs "${staging}/src/"
-          tarball="dist/${package}.tar.gz"
-          tar -C dist -czf "${tarball}" "${package}"
-          echo "TARBALL=${tarball}" >> "$GITHUB_ENV"
-          echo "PACKAGE=${package}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PACKAGE }}
-          path: ${{ env.TARBALL }}
+  validate:
+    uses: ./.github/workflows/validation.yml
+    with:
+      rust: '1.85.0'
 
   release:
-    needs: [prepare, build]
-    runs-on: ubuntu-latest
+    needs: validate
+    runs-on: ubuntu-24.04
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          toolchain: '1.85.0'
+      - name: Configure supported rootless runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman crun
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          sudo systemctl set-property "user@$(id -u).service" Delegate=yes
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build exact locked release and final image
+        run: |
+          sh scripts/package.sh
+          project=$(mktemp -d)
+          cd "$project"
+          "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/ac"
+      - name: Required live containment, resource enforcement and all-agent start
+        run: python3 scripts/smoke-podman.py --binary target/x86_64-unknown-linux-gnu/release/ac --run --required
+      - name: Preserve validated archives and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: ${{ needs.prepare.outputs.release_name }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          files: artifacts/**/*.tar.gz
+          name: agentcage-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
