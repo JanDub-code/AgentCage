@@ -1,4 +1,8 @@
-# New session - 2026-06-11T11:02:00.643Z
+# Historical, unverified conversation — not a security guide
+
+This transcript is preserved as historical source material. Its claims that escape is impossible, that there is no network access to the host, or that exfiltration has no route are incorrect and are not evidence of containment. AgentCage uses host networking; the mounted project is writable; login-enabled runs expose selected saved credentials; containers share the host kernel. Container removal leaves project edits, images, and saved state behind. Use [SECURITY.md](SECURITY.md) and [LOGIN_PERSISTENCE.md](LOGIN_PERSISTENCE.md) for the current contract.
+
+## New session - 2026-06-11T11:02:00.643Z
 
 **Session ID:** ses_149a7653cffegJZQfEq0AuZTA5
 **Created:** 6/11/2026, 11:02:00 AM
