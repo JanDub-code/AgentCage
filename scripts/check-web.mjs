@@ -93,6 +93,9 @@ try {
     const tabs = page.getByRole('tab');
     const tabCount = await tabs.count();
     assert.ok(tabCount >= 2);
+    assert.equal(await page.locator('#install-status').textContent(), '');
+    const panelNames = { 'install-curl': 'curl installation commands',
+        'install-cargo': 'Cargo Git installation commands', 'install-git': 'Source installation commands' };
     await tabs.first().focus();
     for (const [key, index] of [['End', tabCount - 1], ['Home', 0], ['ArrowRight', 1], ['ArrowLeft', 0]]) {
         await page.keyboard.press(key);
@@ -101,8 +104,11 @@ try {
         const panel = await tabs.nth(index).getAttribute('aria-controls');
         assert.equal(await page.locator(`#${panel}`).isVisible(), true);
         assert.equal(await page.locator('[role="tabpanel"]:visible').count(), 1);
+        assert.equal(await page.getByRole('tabpanel', { name: panelNames[panel], exact: true }).isVisible(), true);
+        assert.equal(await page.locator('#install-status').textContent(),
+            `${(await tabs.nth(index).textContent()).trim()} selected. ${panelNames[panel]}.`);
     }
-    results.push('heading and native keyboard tab state');
+    results.push('heading, named installation panels, selection feedback and native keyboard tab state');
     const labels = await page.locator('.copy-btn').evaluateAll(buttons => buttons.map(button => button.getAttribute('aria-label')));
     assert.equal(new Set(labels).size, labels.length);
     assert.ok(labels.every(label => label && label.startsWith('Copy ')));

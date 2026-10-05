@@ -58,6 +58,9 @@
         .tab-btn { border: 2px solid transparent; border-radius: 6px; color: var(--muted); background: transparent; padding: 0.6rem 0.85rem; min-height: 44px; }
         .tab-btn[aria-selected="true"] { color: var(--text); border-bottom-color: var(--cyan); background: #192236; }
         .install-content, .terminal { padding: 1.25rem; }
+        .install-status { margin: 0; padding: 0 1.25rem; color: var(--muted); }
+        .install-status:not(:empty) { padding-top: 0.75rem; }
+        .tab-pane h3 { margin: 0 0 1rem; font-size: 1.1rem; }
         [hidden] { display: none !important; }
         .terminal-header { color: var(--muted); margin-bottom: 1rem; font-size: 0.9rem; }
         .terminal-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 0.5rem 0.75rem; margin: 0.75rem 0; }
@@ -124,15 +127,18 @@
                         <button id="tab-cargo" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="install-cargo" tabindex="-1">Cargo Git</button>
                         <button id="tab-git" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="install-git" tabindex="-1">source</button>
                     </div>
+                    <p id="install-status" class="install-status" role="status" aria-live="polite" aria-atomic="false"></p>
                     <div class="install-content">
-                        <div id="install-curl" class="tab-pane" role="tabpanel" aria-labelledby="tab-curl" aria-describedby="cmd-curl" tabindex="0">
+                        <div id="install-curl" class="tab-pane" role="tabpanel" aria-labelledby="install-curl-heading" aria-describedby="cmd-curl" tabindex="0">
+                            <h3 id="install-curl-heading">curl installation commands</h3>
                             <div class="terminal-line">
                                 <div class="command-text"><span class="terminal-prompt" aria-hidden="true">$</span><code id="cmd-curl" class="terminal-cmd">install_script=$(curl -fsSL https://raw.githubusercontent.com/JanDub-code/AgentCage/main/install.sh) &amp;&amp; { [ -n "$install_script" ] || { printf '%s\n' 'Installer download was empty.' &gt;&amp;2; false; }; } &amp;&amp; printf '%s\n' "$install_script" | sh</code></div>
                                 <button class="copy-btn" type="button" data-copy="cmd-curl" data-label="curl installation command" aria-label="Copy curl installation command">Copy</button>
                                 <span class="copy-status"><span role="status" aria-live="polite" aria-atomic="false"></span><span role="alert" aria-atomic="true"></span></span>
                             </div>
                         </div>
-                        <div id="install-cargo" class="tab-pane" role="tabpanel" aria-labelledby="tab-cargo" aria-describedby="cmd-cargo" tabindex="0" hidden>
+                        <div id="install-cargo" class="tab-pane" role="tabpanel" aria-labelledby="install-cargo-heading" aria-describedby="cmd-cargo" tabindex="0" hidden>
+                            <h3 id="install-cargo-heading">Cargo Git installation commands</h3>
                             <div class="terminal-line">
                                 <div class="command-text"><span class="terminal-prompt" aria-hidden="true">$</span><code id="cmd-cargo" class="terminal-cmd">cargo install --git https://github.com/JanDub-code/AgentCage.git --locked</code></div>
                                 <button class="copy-btn" type="button" data-copy="cmd-cargo" data-label="Cargo Git installation command" aria-label="Copy Cargo Git installation command">Copy</button>
@@ -140,7 +146,8 @@
                             </div>
                             <p class="command-description">Cargo installs to <code>${CARGO_HOME:-$HOME/.cargo}/bin</code>.</p>
                         </div>
-                        <div id="install-git" class="tab-pane" role="tabpanel" aria-labelledby="tab-git" aria-describedby="cmd-git" tabindex="0" hidden>
+                        <div id="install-git" class="tab-pane" role="tabpanel" aria-labelledby="install-git-heading" aria-describedby="cmd-git" tabindex="0" hidden>
+                            <h3 id="install-git-heading">Source installation commands</h3>
                             <div class="terminal-line">
                                 <div class="command-text"><span class="terminal-prompt" aria-hidden="true">$</span><code id="cmd-git" class="terminal-cmd">git clone https://github.com/JanDub-code/AgentCage.git AgentCage &amp;&amp; cd AgentCage &amp;&amp; ./install.sh</code></div>
                                 <button class="copy-btn" type="button" data-copy="cmd-git" data-label="source installation command" aria-label="Copy source installation command">Copy</button>
@@ -262,6 +269,7 @@ ac codex</code></div>
 
         const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
         function activateTab(tab, focus) {
+            const changed = tab.getAttribute('aria-selected') !== 'true';
             tabs.forEach(item => {
                 const selected = item === tab;
                 item.setAttribute('aria-selected', String(selected));
@@ -269,6 +277,12 @@ ac codex</code></div>
                 document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
             });
             if (focus) tab.focus();
+            if (changed) {
+                const panel = document.getElementById(tab.getAttribute('aria-controls'));
+                const heading = document.getElementById(panel.getAttribute('aria-labelledby'));
+                document.getElementById('install-status').textContent =
+                    tab.textContent.trim() + ' selected. ' + heading.textContent + '.';
+            }
         }
         tabs.forEach((tab, index) => {
             tab.addEventListener('click', () => activateTab(tab, false));
