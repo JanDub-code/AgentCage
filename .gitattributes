@@ -1,0 +1,6 @@
+# The Linux entry points and distributed text must remain LF on every checkout.
+* text=auto eol=lf
+*.sh text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+Dockerfile text eol=lf

@@ -1,384 +1,149 @@
 #!/usr/bin/env sh
+# AgentCage installer. Stdin bootstrap never builds the caller's directory.
 set -eu
 
-REPO="JanDub-code/AgentCage"
 prefix="${PREFIX:-$HOME/.local}"
 bindir="${BINDIR:-}"
-want_build=0
-explicit_no_build=0
+build=1
+temp_dir=
+install_temp=
+install_pid=
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--prefix DIR] [--bin-dir DIR] [--build]
+Usage: ./install.sh [--prefix DIR] [--bin-dir DIR] [--no-build]
 
-Installs the ac binary.
+Installs AgentCage (ac) on Linux x86_64.
 
 Options:
   --prefix DIR   install under DIR/bin (default: $HOME/.local)
   --bin-dir DIR  install directly into DIR
-  --build        build from source instead of downloading a pre-built binary
+  --no-build     install a binary package or an existing source release build
+
+Source builds use --locked, the Rust host target, and CARGO_TARGET_DIR if set
+(otherwise ./target). Cargo's configured target and target-dir are overridden.
+Stdin/standalone bootstrap clones AgentCage; --no-build needs a local artifact.
 EOF
 }
 
+fail() { echo "error: $*" >&2; exit 1; }
+cleanup() {
+    if [ -n "$install_pid" ]; then
+        kill -TERM "$install_pid" 2>/dev/null || :
+        kill -CONT "$install_pid" 2>/dev/null || :
+        wait "$install_pid" 2>/dev/null || :
+    fi
+    [ -z "$install_temp" ] || rm -f -- "$install_temp"
+    [ -z "$temp_dir" ] || rm -rf -- "$temp_dir"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --prefix)
-            [ "$#" -ge 2 ] || { echo "error: --prefix needs a value" >&2; exit 2; }
-            prefix="$2"
+        --prefix|--bin-dir)
+            option=$1
+            [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "error: $option needs a value" >&2; exit 2; }
+            case "$2" in --*) echo "error: $option needs a directory value" >&2; exit 2 ;; esac
+            case "$option" in --prefix) prefix=$2 ;; --bin-dir) bindir=$2 ;; esac
             shift 2
             ;;
-        --bin-dir)
-            [ "$#" -ge 2 ] || { echo "error: --bin-dir needs a value" >&2; exit 2; }
-            bindir="$2"
-            shift 2
-            ;;
-        --build)
-            want_build=1
-            shift
-            ;;
-        --no-build)
-            # Legacy flag: skip building, only install existing binary.
-            # When used from a tarball package that already has target/release/ac.
-            want_build=0
-            explicit_no_build=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "error: unknown option: $1" >&2
-            usage >&2
-            exit 2
-            ;;
+        --no-build) build=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [ -z "$bindir" ]; then
-    bindir="$prefix/bin"
-fi
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || fail "supported installer platform: Linux x86_64"
+target_triple=x86_64-unknown-linux-gnu
 
-# ----- Helper: detect architecture -----
+# Keep relative destination/target paths relative to the original caller.
+caller_dir=$(pwd -P)
+[ -n "$bindir" ] || bindir="$prefix/bin"
+case "$bindir" in /*) ;; *) bindir="$caller_dir/$bindir" ;; esac
 
-detect_target() {
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)  arch="x86_64" ;;
-        aarch64|arm64) arch="aarch64" ;;
-        *)
-            echo "error: unsupported architecture: $arch" >&2
-            echo "hint: try --build to compile from source" >&2
-            exit 1
-            ;;
-    esac
-
-    os=$(uname -s)
-    case "$os" in
-        Linux)  target="${arch}-unknown-linux-gnu" ;;
-        *)
-            echo "error: unsupported OS: $os" >&2
-            echo "hint: try --build to compile from source" >&2
-            exit 1
-            ;;
-    esac
-
-    echo "$target"
+source_identity() {
+    [ -f "$1/Cargo.toml" ] && [ -f "$1/Cargo.lock" ] &&
+    [ -f "$1/src/main.rs" ] && [ -f "$1/src/lib.rs" ] &&
+    [ -f "$1/src/agent.rs" ] && [ -f "$1/src/opencode_account.py" ] && [ -f "$1/src/login_sync.py" ] &&
+    [ -f "$1/Dockerfile" ] &&
+    grep -Eq '^name[[:space:]]*=[[:space:]]*"agentcage"[[:space:]]*$' "$1/Cargo.toml" &&
+    grep -Eq '^name[[:space:]]*=[[:space:]]*"ac"[[:space:]]*$' "$1/Cargo.toml"
 }
 
-# ----- Helper: download binary from GitHub Releases -----
-
-download_binary() {
-    target=$(detect_target)
-
-    # Find the latest release tag
-    if command -v curl >/dev/null 2>&1; then
-        latest=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-    elif command -v wget >/dev/null 2>&1; then
-        latest=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-    else
-        echo "error: curl or wget required to download the binary" >&2
-        return 1
-    fi
-
-    if [ -z "$latest" ]; then
-        echo "error: could not determine latest release" >&2
-        return 1
-    fi
-
-    version="${latest#v}"
-    package="agentcage-${version}-${target}"
-    tarball="${package}.tar.gz"
-    url="https://github.com/${REPO}/releases/download/${latest}/${tarball}"
-
-    echo "Downloading ${tarball}..."
-
-    temp_dir=$(mktemp -d)
-    trap 'rm -rf "$temp_dir"' EXIT
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$temp_dir/$tarball" "$url"
-    else
-        wget -q -O "$temp_dir/$tarball" "$url"
-    fi
-
-    tar -xzf "$temp_dir/$tarball" -C "$temp_dir"
-
-    binary="$temp_dir/$package/target/release/ac"
-    if [ ! -x "$binary" ]; then
-        echo "error: binary not found in release archive" >&2
-        return 1
-    fi
-
-    mkdir -p "$bindir"
-    install -m 0755 "$binary" "$bindir/ac"
-
-    # Also install Dockerfile and source files for `ac init` image builds
-    share_dir="${prefix}/share/agentcage"
-    mkdir -p "$share_dir"
-    for f in Dockerfile Cargo.toml Cargo.lock LICENSE README.md SECURITY.md LOGIN_PERSISTENCE.md TUTORIAL.md; do
-        if [ -f "$temp_dir/$package/$f" ]; then
-            install -m 0644 "$temp_dir/$package/$f" "$share_dir/$f"
+script_dir=
+case "$0" in
+    sh|bash|dash|ash|ksh|zsh|-*) ;; # sh -s / curl | sh
+    *)
+        if [ -f "$0" ]; then
+            script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
         fi
-    done
-    if [ -d "$temp_dir/$package/src" ]; then
-        mkdir -p "$share_dir/src"
-        for f in "$temp_dir/$package/src/"*.rs; do
-            [ -f "$f" ] && install -m 0644 "$f" "$share_dir/src/"
-        done
-    fi
+        ;;
+esac
 
-    return 0
-}
-
-# ----- Helper: build from source -----
-
-do_build_from_source() {
-    command -v cargo >/dev/null 2>&1 || {
-        echo "error: cargo not found; install Rust (https://rustup.rs) or omit --build to download a binary" >&2
-        exit 1
-    }
-
-    # Check for a C linker (cc / gcc / clang) — required by the libc crate
-    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-        echo "error: a C compiler (cc/gcc) is required to build from source" >&2
-        echo "hint: on Debian/Ubuntu run: sudo apt install build-essential" >&2
-        echo "hint: on Fedora/RHEL run: sudo dnf groupinstall 'Development Tools'" >&2
-        exit 1
-    fi
-
-    # If we're running from the repo checkout, use it directly
-    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-    if [ -f "$script_dir/Cargo.toml" ]; then
-        cd "$script_dir"
-    else
-        echo "Cloning repository..."
-        temp_dir=$(mktemp -d)
-        trap 'rm -rf "$temp_dir"' EXIT
-        git clone "https://github.com/${REPO}.git" "$temp_dir"
-        cd "$temp_dir"
-    fi
-
-    # Use a fresh target directory to avoid stale/corrupt build artifacts
-    export CARGO_TARGET_DIR="${PWD}/target"
-    cargo clean 2>/dev/null || true
-    cargo build --release
-
-    binary="target/release/ac"
-    if [ ! -x "$binary" ]; then
-        echo "error: release binary not found after build" >&2
-        exit 1
-    fi
-
-    mkdir -p "$bindir"
-    install -m 0755 "$binary" "$bindir/ac"
-}
-
-# ----- Helper: PATH setup -----
-
-path_contains() {
-    case ":${PATH:-}:" in
-        *":$1:"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-ensure_path() {
-    bin_dir="$1"
-
-    if path_contains "$bin_dir"; then
-        return 0
-    fi
-
-    shell_name=$(basename "${SHELL:-sh}")
-    profile="$HOME/.profile"
-
-    case "$shell_name" in
-        bash)
-            profile="$HOME/.bashrc"
-            ;;
-        zsh)
-            profile="$HOME/.zshrc"
-            ;;
-        fish)
-            profile="$HOME/.config/fish/config.fish"
-            mkdir -p "$(dirname "$profile")"
-            ;;
-    esac
-
-    added_line=0
-    if [ "$shell_name" = "fish" ]; then
-        line="fish_add_path $bin_dir"
-    else
-        line='export PATH="$HOME/.local/bin:$PATH"'
-    fi
-
-    if ! grep -Fqs "$line" "$profile" 2>/dev/null; then
-        printf '\n%s\n' "$line" >> "$profile"
-        added_line=1
-    fi
-
-    echo
-    echo "warning: $bin_dir is not in PATH for this shell"
-    if [ "$added_line" -eq 1 ]; then
-        echo "Added this line to $profile for future shells:"
-        echo "  $line"
-    else
-        echo "$profile already has a PATH entry for $bin_dir."
-    fi
-    echo
-    echo "This installer cannot change PATH in your current terminal session."
-    echo "To use ac now, reload your shell profile or open a new shell:"
-    echo "  source $profile"
-    echo
-    echo "Or run ac directly:"
-    echo "  $bin_dir/ac"
-}
-
-os_release_value() {
-    key="$1"
-    if [ -r /etc/os-release ]; then
-        sed -n "s/^${key}=//p" /etc/os-release | head -n 1 | sed 's/^"//; s/"$//'
-    fi
-}
-
-podman_install_hint() {
-    os_id=$(os_release_value ID)
-    os_name=$(os_release_value NAME)
-
-    case "$os_id" in
-        fedora)
-            echo "AgentCage was built first for Fedora, where Podman is usually already present."
-            echo "If it is missing on this system, install it with:"
-            echo
-            echo "  sudo dnf install -y podman"
-            ;;
-        ubuntu|debian)
-            echo "Install Podman first with:"
-            echo
-            echo "  sudo apt install -y podman"
-            ;;
-        arch)
-            echo "Install Podman first with:"
-            echo
-            echo "  sudo pacman -S podman"
-            ;;
-        opensuse-tumbleweed|opensuse-leap)
-            echo "Install Podman first with:"
-            echo
-            echo "  sudo zypper install -y podman"
-            ;;
-        *)
-            if [ -n "$os_name" ]; then
-                echo "Install rootless Podman on $os_name."
-            else
-                echo "Install rootless Podman."
-            fi
-            echo "See: https://podman.io"
-            ;;
-    esac
-}
-
-check_podman_runtime() {
-    echo
-    echo "Runtime check:"
-    if command -v podman >/dev/null 2>&1; then
-        echo "  podman: found ($(podman --version 2>/dev/null || echo podman))"
-        rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)
-        if [ "$rootless" = "true" ]; then
-            echo "  rootless: yes"
-            return 0
-        fi
-        echo "  rootless: no"
-        echo
-        echo "AgentCage requires rootless Podman."
-        echo "Check:"
-        echo
-        echo "  podman info --format '{{.Host.Security.Rootless}}'"
-        echo
-        echo "That command must print:"
-        echo
-        echo "  true"
-        return 0
-    fi
-
-    echo "  podman: missing"
-    echo
-    podman_install_hint
-    echo
-    echo "After installing Podman, verify rootless mode:"
-    echo
-    echo "  podman info --format '{{.Host.Security.Rootless}}'"
-    echo
-    echo "That command must print:"
-    echo
-    echo "  true"
-}
-
-# ----- Main -----
-
-# If we're being run from a tarball that already contains the binary,
-# install it directly (for backwards compatibility with package.sh tarballs)
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-prebuilt="$script_dir/target/release/ac"
-repo_checkout=0
-if [ -f "$script_dir/Cargo.toml" ]; then
-    repo_checkout=1
+package=0
+if [ -n "$script_dir" ] && [ -f "$script_dir/RELEASE" ]; then
+    package=1
+elif [ -z "$script_dir" ] || ! source_identity "$script_dir"; then
+    [ "$build" -eq 1 ] || fail "--no-build needs an extracted AgentCage binary package or an existing local source release build; bootstrap cannot supply one"
+    command -v git >/dev/null 2>&1 || fail "git is required for source bootstrap"
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentcage-install.XXXXXXXX")
+    echo "Cloning AgentCage source..."
+    git clone --depth 1 -- https://github.com/JanDub-code/AgentCage.git "$temp_dir/source" </dev/null
+    script_dir="$temp_dir/source"
+    source_identity "$script_dir" || fail "downloaded source is not an AgentCage checkout"
 fi
 
-if [ -x "$prebuilt" ] && { [ "$explicit_no_build" -eq 1 ] || [ "$repo_checkout" -eq 0 ]; }; then
-    mkdir -p "$bindir"
-    install -m 0755 "$prebuilt" "$bindir/ac"
-elif [ "$want_build" -eq 1 ]; then
-    do_build_from_source
-elif [ "$repo_checkout" -eq 1 ]; then
-    do_build_from_source
+if [ "$package" -eq 1 ]; then
+    [ "$build" -eq 0 ] || fail "binary package: use ./install.sh --no-build"
+    [ "$(sed -n 's/^name=//p' "$script_dir/RELEASE")" = agentcage ] || fail "invalid AgentCage release metadata"
+    version=$(sed -n 's/^version=//p' "$script_dir/RELEASE")
+    package_target=$(sed -n 's/^target=//p' "$script_dir/RELEASE")
+    [ "$package_target" = "$target_triple" ] || fail "package target $package_target does not match $target_triple"
+    binary="$script_dir/bin/ac"
+    expected_sha=$(sed -n 's/^binary_sha256=//p' "$script_dir/RELEASE")
+    [ "${#expected_sha}" -eq 64 ] || fail "invalid release binary checksum"
+    case "$expected_sha" in *[!0-9a-f]*) fail "invalid release binary checksum" ;; esac
+    [ -x "$binary" ] || fail "release binary not found: $binary"
+    actual_sha=$(sha256sum "$binary")
+    actual_sha=${actual_sha%% *}
+    [ "$actual_sha" = "$expected_sha" ] || fail "release binary checksum mismatch: $binary"
 else
-    # Default: download pre-built binary from GitHub Releases
-    if ! download_binary; then
-        echo ""
-        echo "Pre-built binary download failed. Falling back to building from source..."
-        echo ""
-        want_build=1
-        do_build_from_source
+    version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$script_dir/Cargo.toml" | head -n 1)
+    target_dir="${CARGO_TARGET_DIR:-$script_dir/target}"
+    case "$target_dir" in /*) ;; *) target_dir="$caller_dir/$target_dir" ;; esac
+    binary="$target_dir/$target_triple/release/ac"
+    if [ "$build" -eq 1 ]; then
+        command -v cargo >/dev/null 2>&1 || fail "cargo not found; install Rust or use a binary release with --no-build"
+        command -v rustc >/dev/null 2>&1 || fail "rustc not found"
+        rust_host=$(rustc -vV | sed -n 's/^host: //p')
+        [ "$rust_host" = "$target_triple" ] || fail "Rust host $rust_host does not match supported target $target_triple"
+        (cd "$script_dir" && cargo build --locked --release --bin ac --target "$target_triple" --target-dir "$target_dir" </dev/null)
     fi
+    [ -x "$binary" ] || fail "release binary not found: $binary; run ./install.sh or use an extracted binary package with --no-build"
 fi
 
-echo "installed: $bindir/ac"
-if path_contains "$bindir"; then
-    echo
-    echo "Next:"
-    echo "  ac"
-elif [ "$bindir" = "$HOME/.local/bin" ]; then
-    ensure_path "$bindir"
+case "$version" in ''|*[!0-9A-Za-z.+-]*) fail "invalid AgentCage version in release metadata" ;; esac
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' || fail "invalid AgentCage version in release metadata"
+mkdir -p -- "$bindir"
+# Finish the copy on the destination filesystem before replacing a working ac.
+install_temp=$(mktemp "$bindir/.agentcage-install.XXXXXXXX")
+install -m 0755 -- "$binary" "$install_temp" &
+install_pid=$!
+if wait "$install_pid"; then
+    install_pid=
 else
-    echo
-    echo "warning: $bindir is not in PATH"
-    echo "This installer only auto-updates shell profiles for $HOME/.local/bin."
-    echo "Add it to your shell configuration if needed."
-    echo
-    echo "Run ac directly:"
-    echo "  $bindir/ac"
+    install_status=$?
+    install_pid=
+    exit "$install_status"
 fi
-
-check_podman_runtime
+mv -fT -- "$install_temp" "$bindir/ac"
+install_temp=
+echo "installed AgentCage $version ($target_triple): $bindir/ac"
+case ":$PATH:" in
+    *":$bindir:"*) ;;
+    *) echo "warning: $bindir is not in PATH; add this directory to your shell profile" ;;
+esac
+echo "Next: ac"

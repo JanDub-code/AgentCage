@@ -2,3 +2,5 @@
 /dist/
 /.agentcage/
 .antigravitycli/
+__pycache__/
+*.pyc
